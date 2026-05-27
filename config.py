@@ -3,8 +3,8 @@
 # ============================================================
 
 # --- Telegram ---
-TELEGRAM_BOT_TOKEN = "8583665201:AAGR8HhKsL88u9d0gDX2uie9q5WOZFNHwKA"       # Ex: "7312345678:AAF..."
-TELEGRAM_CHAT_ID   = "8583665201"     # Ex: "123456789"
+TELEGRAM_BOT_TOKEN = "8583665201:AAEiypnwXtItDay2hymNztATZzPZhpySZgw"       # Ex: "7312345678:AAF..."
+TELEGRAM_CHAT_ID   = "588598476"     # Ex: "123456789"
 
 # --- Google Drive ---
 # Cole aqui o ID do arquivo .xlsx no Google Drive
