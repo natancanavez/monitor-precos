@@ -120,12 +120,13 @@ def extrair_preco_ml(url: str) -> float | None:
                 resultados = data.get("results", [])
                 precos = []
                 for r in resultados:
-                    p = r.get("original_price") or r.get("price")
+                    # Usa price (preço Pix/final) como base
+                    p = r.get("price")
                     if p:
                         precos.append(float(p))
                 if precos:
                     preco = min(precos)
-                    log.info("API ML catálogo: %s → R$ %.2f", item_id, preco)
+                    log.info("API ML catálogo (menor preço Pix): %s → R$ %.2f", item_id, preco)
                     return preco
  
             # Fallback: busca o item diretamente
