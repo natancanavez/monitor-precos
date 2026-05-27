@@ -1,9 +1,9 @@
 """
 monitor_precos.py
-1. Baixa a planilha do Google Drive
-2. Raspa preços do ML via API oficial e do fornecedor via scraping
-3. Atualiza colunas 4-6 e colore status
-4. Sobe a planilha atualizada de volta ao Google Drive
+1. Lê produtos do Google Sheets
+2. Raspa preços do ML via API oficial
+3. Raspa preços do fornecedor via ScraperAPI
+4. Atualiza colunas 4-6 no Google Sheets
 5. Envia alertas via Telegram quando necessário
 """
  
@@ -14,16 +14,13 @@ import logging
 import requests
 import os
 from datetime import datetime
-from pathlib import Path
  
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment
-from bs4 import BeautifulSoup
+import gspread
+from google.oauth2.service_account import Credentials
  
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     COMISSAO_ML, IMPOSTO_DAS, MARGEM_MIN, FRETE_FIXO,
-    GDRIVE_FILE_ID, PLANILHA_PATH,
 )
  
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -46,60 +43,46 @@ HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9",
 }
  
-DESCONTO = COMISSAO_ML + IMPOSTO_DAS + MARGEM_MIN  # 0.28
- 
-# Token ML — lido da variável de ambiente ou config
+DESCONTO        = COMISSAO_ML + IMPOSTO_DAS + MARGEM_MIN
 ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
+SHEETS_ID       = os.environ.get("SHEETS_ID", "")
  
 # ── Fórmula PMC ──────────────────────────────────────────────────────────────
 def calcular_pmc(preco_ml: float) -> float:
     return round(preco_ml * (1 - DESCONTO) - FRETE_FIXO, 2)
  
-# ── Google Drive ──────────────────────────────────────────────────────────────
-def gdrive_download(file_id: str, destino: str) -> bool:
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    try:
-        sess = requests.Session()
-        resp = sess.get(url, stream=True, timeout=30)
-        for key, val in resp.cookies.items():
-            if "download_warning" in key:
-                url = f"{url}&confirm={val}"
-                resp = sess.get(url, stream=True, timeout=30)
-                break
-        resp.raise_for_status()
-        Path(destino).parent.mkdir(parents=True, exist_ok=True)
-        with open(destino, "wb") as f:
-            for chunk in resp.iter_content(32768):
-                f.write(chunk)
-        log.info("Planilha baixada do Drive → %s", destino)
-        return True
-    except Exception as e:
-        log.error("Erro ao baixar do Drive: %s", e)
-        return False
+# ── Google Sheets ─────────────────────────────────────────────────────────────
+def conectar_sheets():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file("/app/service-account.json", scopes=scopes)
+    client = gspread.authorize(creds)
+    return client.open_by_key(SHEETS_ID).sheet1
  
  
-def gdrive_upload(file_id: str, caminho: str) -> bool:
-    log.info("Planilha atualizada salva em: %s", caminho)
-    log.info("Para sincronizar com o Drive, use: rclone copy %s gdrive:/Monitor-Precos/", caminho)
-    return True
+def garantir_cabecalhos(ws) -> None:
+    headers = ws.row_values(1)
+    esperados = [
+        "SKU", "Link ML", "Link Fornecedor",
+        "Preço ML (R$)", "Preço Fornecedor (R$)",
+        "PMC Máximo (R$)", "Status", "Última Atualização",
+    ]
+    if headers != esperados:
+        ws.update("A1:H1", [esperados])
+        log.info("Cabeçalhos criados na planilha.")
  
  
-# ── Scraper ML via API Oficial ────────────────────────────────────────────────
-def extrair_item_id_ml(url: str) -> tuple[str, str]:
-    """
-    Retorna (tipo, id) onde tipo é 'item' (MLB123) ou 'catalog' (MLB123 de catálogo).
-    """
-    # Produto de catálogo: /p/MLB123
+# ── Scraper ML ────────────────────────────────────────────────────────────────
+def extrair_item_id_ml(url: str) -> tuple:
     m = re.search(r'/p/(MLB\d+)', url, re.IGNORECASE)
     if m:
         return ('catalog', m.group(1).upper())
- 
-    # Item direto: /MLB123... ou MLB-123
     m = re.search(r'(MLB-?\d+)', url, re.IGNORECASE)
     if m:
         return ('item', m.group(1).upper().replace("-", ""))
- 
     return (None, None)
  
  
@@ -107,59 +90,44 @@ def extrair_preco_ml(url: str) -> float | None:
     try:
         tipo, item_id = extrair_item_id_ml(url)
         if not item_id:
-            log.warning("Item ID ML não encontrado na URL: %s", url)
+            log.warning("Item ID ML não encontrado: %s", url)
             return None
  
         headers_ml = {"Authorization": f"Bearer {ML_ACCESS_TOKEN}"} if ML_ACCESS_TOKEN else {}
  
         if tipo == 'catalog':
-            # Busca itens do catálogo e pega o menor preço original
-            api_url = f"https://api.mercadolibre.com/products/{item_id}/items"
-            resp = requests.get(api_url, headers=headers_ml, timeout=15)
+            resp = requests.get(
+                f"https://api.mercadolibre.com/products/{item_id}/items",
+                headers=headers_ml, timeout=15
+            )
             if resp.status_code == 200:
-                data = resp.json()
-                resultados = data.get("results", [])
-                precos = []
-                for r in resultados:
-                    # Usa price (preço Pix/final) como base
-                    p = r.get("price")
-                    if p:
-                        precos.append(float(p))
+                resultados = resp.json().get("results", [])
+                precos = [float(r["price"]) for r in resultados if r.get("price")]
                 if precos:
                     preco = min(precos)
                     log.info("API ML catálogo (menor preço Pix): %s → R$ %.2f", item_id, preco)
                     return preco
  
-            # Fallback: busca o item diretamente
-            api_url = f"https://api.mercadolibre.com/items/{item_id}"
-            resp = requests.get(api_url, headers=headers_ml, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                preco = data.get("original_price") or data.get("price")
-                if preco:
-                    log.info("API ML item direto: %s → R$ %.2f", item_id, float(preco))
-                    return float(preco)
-        else:
-            api_url = f"https://api.mercadolibre.com/items/{item_id}"
-            resp = requests.get(api_url, headers=headers_ml, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                preco = data.get("original_price") or data.get("price")
-                if preco:
-                    log.info("API ML: %s → R$ %.2f", item_id, float(preco))
-                    return float(preco)
+        resp = requests.get(
+            f"https://api.mercadolibre.com/items/{item_id}",
+            headers=headers_ml, timeout=15
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            preco = data.get("price")
+            if preco:
+                log.info("API ML item: %s → R$ %.2f", item_id, float(preco))
+                return float(preco)
  
-        log.warning("Preço ML não encontrado: %s (status %s)", item_id, resp.status_code)
+        log.warning("Preço ML não encontrado: %s", item_id)
         return None
- 
     except Exception as e:
         log.error("Erro ML (%s): %s", url, e)
         return None
  
  
 # ── Scraper Fornecedor ────────────────────────────────────────────────────────
-def fetch_url(url: str) -> requests.Response | None:
-    """Busca URL usando ScraperAPI se disponível, senão direto."""
+def fetch_url(url: str):
     try:
         if SCRAPER_API_KEY:
             api_url = (
@@ -179,6 +147,7 @@ def fetch_url(url: str) -> requests.Response | None:
  
  
 def extrair_preco_fornecedor(url: str) -> float | None:
+    from bs4 import BeautifulSoup
     try:
         resp = fetch_url(url)
         if not resp:
@@ -186,7 +155,6 @@ def extrair_preco_fornecedor(url: str) -> float | None:
  
         soup = BeautifulSoup(resp.text, "lxml")
  
-        # Meta tags og
         for meta_name in ["product:price:amount", "og:price:amount"]:
             tag = soup.find("meta", property=meta_name)
             if tag and tag.get("content"):
@@ -194,7 +162,6 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                 if v:
                     return float(v)
  
-        # itemprop=price
         tag = soup.find(attrs={"itemprop": "price"})
         if tag:
             valor = tag.get("content") or tag.get_text(strip=True)
@@ -202,7 +169,6 @@ def extrair_preco_fornecedor(url: str) -> float | None:
             if valor:
                 return float(valor)
  
-        # JSON-LD
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(tag.string)
@@ -217,7 +183,6 @@ def extrair_preco_fornecedor(url: str) -> float | None:
             except Exception:
                 pass
  
-        # Amazon específico
         if "amazon" in url:
             el = soup.select_one("span.a-price-whole")
             if el:
@@ -225,21 +190,13 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                 if v:
                     return float(v)
  
-        # Seletores comuns
-        for sel in [
-            "[class*='price'] [class*='value']",
-            "[class*='preco']",
-            "[class*='price']",
-            "[id*='price']",
-        ]:
+        for sel in ["[class*='price'] [class*='value']", "[class*='preco']", "[class*='price']"]:
             el = soup.select_one(sel)
             if el:
-                texto = el.get_text(strip=True)
-                nums = re.findall(r"\d+[.,]\d{2}", texto)
+                nums = re.findall(r"\d+[.,]\d{2}", el.get_text(strip=True))
                 if nums:
-                    v = nums[0].replace(".", "").replace(",", ".")
                     try:
-                        return float(v)
+                        return float(nums[0].replace(".", "").replace(",", "."))
                     except Exception:
                         pass
  
@@ -265,104 +222,50 @@ def telegram_send(mensagem: str) -> None:
         log.error("Erro Telegram: %s", e)
  
  
-# ── Planilha ──────────────────────────────────────────────────────────────────
-HEADER_ROW = 1
-DATA_START  = 2
- 
-COL_SKU, COL_LINK_ML, COL_LINK_FORN = 1, 2, 3
-COL_PRECO_ML, COL_PRECO_FORN, COL_PMC = 4, 5, 6
-COL_STATUS, COL_ATUALIZADO = 7, 8
- 
-COR_OK     = "C6EFCE"
-COR_ALERTA = "FFEB9C"
-COR_PERIGO = "FFC7CE"
-COR_HEADER = "2E75B6"
- 
- 
-def garantir_cabecalhos(ws) -> None:
-    if ws.cell(1, 1).value == "SKU":
-        return
-    headers = [
-        "SKU", "Link ML", "Link Fornecedor",
-        "Preço ML (R$)", "Preço Fornecedor (R$)",
-        "PMC Máximo (R$)", "Status", "Última Atualização",
-    ]
-    for col, titulo in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col, value=titulo)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor=COR_HEADER)
-        cell.alignment = Alignment(horizontal="center")
-    larguras = {"A":18,"B":55,"C":55,"D":18,"E":22,"F":20,"G":30,"H":22}
-    for col, w in larguras.items():
-        ws.column_dimensions[col].width = w
- 
- 
-def colorir_linha(ws, row: int, cor: str) -> None:
-    fill = PatternFill("solid", fgColor=cor)
-    for col in range(COL_PRECO_ML, COL_ATUALIZADO + 1):
-        ws.cell(row=row, column=col).fill = fill
- 
- 
-def estados_anteriores(ws) -> dict:
-    estados = {}
-    for row in ws.iter_rows(min_row=DATA_START, values_only=True):
-        sku    = row[COL_SKU - 1]
-        status = row[COL_STATUS - 1] if len(row) >= COL_STATUS else None
-        if sku:
-            estados[str(sku)] = status or ""
-    return estados
- 
- 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def processar() -> None:
-    if not gdrive_download(GDRIVE_FILE_ID, PLANILHA_PATH):
-        log.error("Não foi possível baixar a planilha. Abortando.")
+    try:
+        ws = conectar_sheets()
+        log.info("Conectado ao Google Sheets ✅")
+    except Exception as e:
+        log.error("Erro ao conectar Google Sheets: %s", e)
         return
  
-    wb = openpyxl.load_workbook(PLANILHA_PATH)
-    ws = wb.active
     garantir_cabecalhos(ws)
  
-    ant = estados_anteriores(ws)
+    todos_dados = ws.get_all_values()
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
     alertas = []
  
-    for row_idx in range(DATA_START, ws.max_row + 1):
-        sku       = ws.cell(row_idx, COL_SKU).value
-        link_ml   = ws.cell(row_idx, COL_LINK_ML).value
-        link_forn = ws.cell(row_idx, COL_LINK_FORN).value
+    for row_idx, row in enumerate(todos_dados[1:], start=2):
+        if len(row) < 3:
+            continue
+ 
+        sku       = row[0].strip()
+        link_ml   = row[1].strip()
+        link_forn = row[2].strip()
  
         if not sku or not link_ml or not link_forn:
             continue
  
+        # Status anterior
+        status_ant = row[6].strip() if len(row) > 6 else ""
+ 
         log.info("Processando SKU %s ...", sku)
  
-        preco_ml   = extrair_preco_ml(str(link_ml))
+        preco_ml   = extrair_preco_ml(link_ml)
         time.sleep(1.5)
-        preco_forn = extrair_preco_fornecedor(str(link_forn))
+        preco_forn = extrair_preco_fornecedor(link_forn)
         time.sleep(1.5)
- 
-        ws.cell(row_idx, COL_ATUALIZADO).value = agora
  
         if preco_ml is None or preco_forn is None:
-            ws.cell(row_idx, COL_STATUS).value = "⚠️ Erro na leitura"
-            colorir_linha(ws, row_idx, COR_ALERTA)
+            ws.update(f"G{row_idx}:H{row_idx}", [["⚠️ Erro na leitura", agora]])
             continue
  
         pmc = calcular_pmc(preco_ml)
  
-        ws.cell(row_idx, COL_PRECO_ML).value   = preco_ml
-        ws.cell(row_idx, COL_PRECO_FORN).value = preco_forn
-        ws.cell(row_idx, COL_PMC).value        = pmc
- 
-        for col in (COL_PRECO_ML, COL_PRECO_FORN, COL_PMC):
-            ws.cell(row_idx, col).number_format = 'R$ #,##0.00'
- 
-        status_ant = ant.get(str(sku), "")
- 
         if preco_forn > pmc:
             status = "🚨 ACIMA DO PMC"
-            colorir_linha(ws, row_idx, COR_PERIGO)
             if status_ant != status:
                 alertas.append(
                     f"🚨 <b>ALERTA — Fornecedor acima do PMC</b>\n"
@@ -374,7 +277,6 @@ def processar() -> None:
                 )
         else:
             status = "✅ OK"
-            colorir_linha(ws, row_idx, COR_OK)
             if status_ant == "🚨 ACIMA DO PMC":
                 alertas.append(
                     f"✅ <b>NORMALIZADO — Fornecedor voltou abaixo do PMC</b>\n"
@@ -385,13 +287,20 @@ def processar() -> None:
                     f"Data: {agora}"
                 )
  
-        ws.cell(row_idx, COL_STATUS).value = status
+        ws.update(f"D{row_idx}:H{row_idx}", [[
+            f"R$ {preco_ml:.2f}",
+            f"R$ {preco_forn:.2f}",
+            f"R$ {pmc:.2f}",
+            status,
+            agora,
+        ]])
+ 
         log.info("  ML=R$%.2f  Forn=R$%.2f  PMC=R$%.2f  → %s",
                  preco_ml, preco_forn, pmc, status)
  
-    wb.save(PLANILHA_PATH)
-    log.info("Planilha salva localmente.")
-    gdrive_upload(GDRIVE_FILE_ID, PLANILHA_PATH)
+        time.sleep(1)  # Evita rate limit do Sheets
+ 
+    log.info("Planilha atualizada no Google Sheets ✅")
  
     for alerta in alertas:
         telegram_send(alerta)
