@@ -1,18 +1,18 @@
 """
 monitor_precos.py
 1. Baixa a planilha do Google Drive
-2. Raspa preços do ML e do fornecedor
+2. Raspa preços do ML via API oficial e do fornecedor via scraping
 3. Atualiza colunas 4-6 e colore status
 4. Sobe a planilha atualizada de volta ao Google Drive
 5. Envia alertas via Telegram quando necessário
 """
  
 import re
-import io
 import json
 import time
 import logging
 import requests
+import os
 from datetime import datetime
 from pathlib import Path
  
@@ -48,25 +48,24 @@ HEADERS = {
  
 DESCONTO = COMISSAO_ML + IMPOSTO_DAS + MARGEM_MIN  # 0.28
  
+# Token ML — lido da variável de ambiente ou config
+ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
+ 
 # ── Fórmula PMC ──────────────────────────────────────────────────────────────
 def calcular_pmc(preco_ml: float) -> float:
     return round(preco_ml * (1 - DESCONTO) - FRETE_FIXO, 2)
  
 # ── Google Drive ──────────────────────────────────────────────────────────────
 def gdrive_download(file_id: str, destino: str) -> bool:
-    """Baixa arquivo .xlsx público do Google Drive."""
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     try:
         sess = requests.Session()
         resp = sess.get(url, stream=True, timeout=30)
- 
-        # Google pode pedir confirmação para arquivos grandes
         for key, val in resp.cookies.items():
             if "download_warning" in key:
                 url = f"{url}&confirm={val}"
                 resp = sess.get(url, stream=True, timeout=30)
                 break
- 
         resp.raise_for_status()
         Path(destino).parent.mkdir(parents=True, exist_ok=True)
         with open(destino, "wb") as f:
@@ -80,65 +79,96 @@ def gdrive_download(file_id: str, destino: str) -> bool:
  
  
 def gdrive_upload(file_id: str, caminho: str) -> bool:
-    """
-    Atualiza o arquivo no Google Drive via API pública de upload.
-    IMPORTANTE: para upload funcionar com link público, o arquivo precisa
-    estar em uma pasta com permissão de edição via link, e usamos
-    a Google Drive API v3 com upload multipart.
-    Como estamos usando acesso público simples, salvamos localmente e
-    avisamos o usuário para sincronizar manualmente OU usar rclone.
-    Veja README para configurar rclone (recomendado).
-    """
     log.info("Planilha atualizada salva em: %s", caminho)
     log.info("Para sincronizar com o Drive, use: rclone copy %s gdrive:/Monitor-Precos/", caminho)
     return True
  
  
-# ── Scrapers ─────────────────────────────────────────────────────────────────
+# ── Scraper ML via API Oficial ────────────────────────────────────────────────
+def extrair_item_id_ml(url: str) -> tuple[str, str]:
+    """
+    Retorna (tipo, id) onde tipo é 'item' (MLB123) ou 'catalog' (MLB123 de catálogo).
+    """
+    # Produto de catálogo: /p/MLB123
+    m = re.search(r'/p/(MLB\d+)', url, re.IGNORECASE)
+    if m:
+        return ('catalog', m.group(1).upper())
+ 
+    # Item direto: /MLB123... ou MLB-123
+    m = re.search(r'(MLB-?\d+)', url, re.IGNORECASE)
+    if m:
+        return ('item', m.group(1).upper().replace("-", ""))
+ 
+    return (None, None)
+ 
+ 
 def extrair_preco_ml(url: str) -> float | None:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
+        tipo, item_id = extrair_item_id_ml(url)
+        if not item_id:
+            log.warning("Item ID ML não encontrado na URL: %s", url)
+            return None
  
-        seletores = [
-            "span.andes-money-amount__fraction",
-            "meta[itemprop='price']",
-            "span.price-tag-fraction",
-        ]
-        for sel in seletores:
-            el = soup.select_one(sel)
-            if el:
-                valor = el.get("content") or el.get_text(strip=True)
-                valor = valor.replace(".", "").replace(",", ".")
-                return float(re.sub(r"[^\d.]", "", valor))
+        headers_ml = {"Authorization": f"Bearer {ML_ACCESS_TOKEN}"} if ML_ACCESS_TOKEN else {}
  
-        for tag in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(tag.string)
-                if isinstance(data, dict) and "offers" in data:
-                    return float(data["offers"].get("price", 0))
-            except Exception:
-                pass
+        if tipo == 'catalog':
+            # Busca itens do catálogo e pega o menor preço original
+            api_url = f"https://api.mercadolibre.com/products/{item_id}/items"
+            resp = requests.get(api_url, headers=headers_ml, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                resultados = data.get("results", [])
+                precos = []
+                for r in resultados:
+                    p = r.get("original_price") or r.get("price")
+                    if p:
+                        precos.append(float(p))
+                if precos:
+                    preco = min(precos)
+                    log.info("API ML catálogo: %s → R$ %.2f", item_id, preco)
+                    return preco
  
-        log.warning("Preço ML não encontrado: %s", url)
+            # Fallback: busca o item diretamente
+            api_url = f"https://api.mercadolibre.com/items/{item_id}"
+            resp = requests.get(api_url, headers=headers_ml, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                preco = data.get("original_price") or data.get("price")
+                if preco:
+                    log.info("API ML item direto: %s → R$ %.2f", item_id, float(preco))
+                    return float(preco)
+        else:
+            api_url = f"https://api.mercadolibre.com/items/{item_id}"
+            resp = requests.get(api_url, headers=headers_ml, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                preco = data.get("original_price") or data.get("price")
+                if preco:
+                    log.info("API ML: %s → R$ %.2f", item_id, float(preco))
+                    return float(preco)
+ 
+        log.warning("Preço ML não encontrado: %s (status %s)", item_id, resp.status_code)
         return None
+ 
     except Exception as e:
         log.error("Erro ML (%s): %s", url, e)
         return None
  
  
+# ── Scraper Fornecedor ────────────────────────────────────────────────────────
 def extrair_preco_fornecedor(url: str) -> float | None:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
  
+        # Meta tags og
         for meta_name in ["product:price:amount", "og:price:amount"]:
             tag = soup.find("meta", property=meta_name)
             if tag and tag.get("content"):
                 return float(re.sub(r"[^\d.]", "", tag["content"].replace(",", ".")))
  
+        # itemprop=price
         tag = soup.find(attrs={"itemprop": "price"})
         if tag:
             valor = tag.get("content") or tag.get_text(strip=True)
@@ -146,6 +176,7 @@ def extrair_preco_fornecedor(url: str) -> float | None:
             if valor:
                 return float(valor)
  
+        # JSON-LD
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(tag.string)
@@ -159,6 +190,27 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                         return float(price)
             except Exception:
                 pass
+ 
+        # Seletores comuns de preço
+        seletores = [
+            "[class*='price'] [class*='value']",
+            "[class*='preco']",
+            "[class*='price']",
+            "[id*='price']",
+        ]
+        for sel in seletores:
+            el = soup.select_one(sel)
+            if el:
+                texto = el.get_text(strip=True)
+                nums = re.sub(r"[^\d,]", "", texto)
+                if nums:
+                    valor = nums.replace(",", ".")
+                    try:
+                        v = float(valor)
+                        if v > 0:
+                            return v
+                    except Exception:
+                        pass
  
         log.warning("Preço fornecedor não encontrado: %s", url)
         return None
@@ -232,7 +284,6 @@ def estados_anteriores(ws) -> dict:
  
 # ── Main ──────────────────────────────────────────────────────────────────────
 def processar() -> None:
-    # 1. Baixar do Drive
     if not gdrive_download(GDRIVE_FILE_ID, PLANILHA_PATH):
         log.error("Não foi possível baixar a planilha. Abortando.")
         return
@@ -307,14 +358,10 @@ def processar() -> None:
         log.info("  ML=R$%.2f  Forn=R$%.2f  PMC=R$%.2f  → %s",
                  preco_ml, preco_forn, pmc, status)
  
-    # 2. Salvar planilha
     wb.save(PLANILHA_PATH)
     log.info("Planilha salva localmente.")
- 
-    # 3. Subir de volta ao Drive via rclone
     gdrive_upload(GDRIVE_FILE_ID, PLANILHA_PATH)
  
-    # 4. Enviar alertas
     for alerta in alertas:
         telegram_send(alerta)
  
@@ -324,6 +371,5 @@ def processar() -> None:
  
 if __name__ == "__main__":
     log.info("=== Container iniciado — aguardando agendamento do Dokploy ===")
-    # Mantém o container vivo para que o Dokploy possa executar via docker exec
     while True:
         time.sleep(60)
