@@ -58,13 +58,9 @@ def conectar_sheets():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    google_creds_json = os.environ.get("GOOGLE_CREDENTIALS", "")
-    if google_creds_json:
-        import json as _json
-        info = _json.loads(google_creds_json)
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-    else:
-        creds = Credentials.from_service_account_file("/app/service-account.json", scopes=scopes)
+    import json as _json
+    info = _json.loads(os.environ.get("GOOGLE_CREDENTIALS", ""))
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEETS_ID).sheet1
  
