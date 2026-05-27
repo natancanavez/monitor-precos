@@ -50,6 +50,7 @@ DESCONTO = COMISSAO_ML + IMPOSTO_DAS + MARGEM_MIN  # 0.28
  
 # Token ML — lido da variável de ambiente ou config
 ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
  
 # ── Fórmula PMC ──────────────────────────────────────────────────────────────
 def calcular_pmc(preco_ml: float) -> float:
@@ -157,17 +158,41 @@ def extrair_preco_ml(url: str) -> float | None:
  
  
 # ── Scraper Fornecedor ────────────────────────────────────────────────────────
+def fetch_url(url: str) -> requests.Response | None:
+    """Busca URL usando ScraperAPI se disponível, senão direto."""
+    try:
+        if SCRAPER_API_KEY:
+            api_url = (
+                f"http://api.scraperapi.com"
+                f"?api_key={SCRAPER_API_KEY}"
+                f"&url={requests.utils.quote(url, safe='')}"
+                f"&country_code=br&render=true"
+            )
+            resp = requests.get(api_url, timeout=60)
+        else:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        return resp
+    except Exception as e:
+        log.error("Erro ao buscar URL (%s): %s", url, e)
+        return None
+ 
+ 
 def extrair_preco_fornecedor(url: str) -> float | None:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
+        resp = fetch_url(url)
+        if not resp:
+            return None
+ 
         soup = BeautifulSoup(resp.text, "lxml")
  
         # Meta tags og
         for meta_name in ["product:price:amount", "og:price:amount"]:
             tag = soup.find("meta", property=meta_name)
             if tag and tag.get("content"):
-                return float(re.sub(r"[^\d.]", "", tag["content"].replace(",", ".")))
+                v = re.sub(r"[^\d.]", "", tag["content"].replace(",", "."))
+                if v:
+                    return float(v)
  
         # itemprop=price
         tag = soup.find(attrs={"itemprop": "price"})
@@ -192,24 +217,29 @@ def extrair_preco_fornecedor(url: str) -> float | None:
             except Exception:
                 pass
  
-        # Seletores comuns de preço
-        seletores = [
+        # Amazon específico
+        if "amazon" in url:
+            el = soup.select_one("span.a-price-whole")
+            if el:
+                v = re.sub(r"[^\d]", "", el.get_text())
+                if v:
+                    return float(v)
+ 
+        # Seletores comuns
+        for sel in [
             "[class*='price'] [class*='value']",
             "[class*='preco']",
             "[class*='price']",
             "[id*='price']",
-        ]
-        for sel in seletores:
+        ]:
             el = soup.select_one(sel)
             if el:
                 texto = el.get_text(strip=True)
-                nums = re.sub(r"[^\d,]", "", texto)
+                nums = re.findall(r"\d+[.,]\d{2}", texto)
                 if nums:
-                    valor = nums.replace(",", ".")
+                    v = nums[0].replace(".", "").replace(",", ".")
                     try:
-                        v = float(valor)
-                        if v > 0:
-                            return v
+                        return float(v)
                     except Exception:
                         pass
  
