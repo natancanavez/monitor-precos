@@ -7,8 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
  
 COPY monitor_precos.py .
 COPY config.py .
-COPY service-account.json .
  
 RUN mkdir -p /data
  
-CMD ["python", "monitor_precos.py"]
+# Se existir versão corrigida no volume, usa ela
+CMD ["bash", "-c", "[ -f /data/monitor_precos.py ] && cp /data/monitor_precos.py /app/monitor_precos.py; python monitor_precos.py"]
