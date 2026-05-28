@@ -176,41 +176,40 @@ def extrair_preco_fornecedor(url: str) -> float | None:
             except Exception:
                 pass
         if "amazon" in url:
-            # Tenta Programe e Poupe primeiro
-            sns_seletores = [
-                "#sns-base-price",
-                "#subscriptionPrice",
-                "#priceblock_snsprice",
-                ".sns-price",
-                "[data-a-color='price'] .a-offscreen",
-            ]
-            for sel in sns_seletores:
-                el = soup.select_one(sel)
-                if el:
-                    texto = el.get("content") or el.get_text(strip=True)
-                    v = re.sub(r"[^\d,.]", "", texto).replace(".", "").replace(",", ".")
-                    if v:
-                        try:
-                            preco_sns = float(v)
-                            if preco_sns > 0:
-                                log.info("Amazon Programe e Poupe: R$ %.2f", preco_sns)
-                                return preco_sns
-                        except Exception:
-                            pass
+            # Tenta Programe e Poupe (apex-pricetopay = preço final com desconto P&P)
+            el = soup.select_one("#apex-pricetopay-accessibility-label")
+            if el:
+                texto = el.get_text(strip=True)
+                # Ex: "R$ 129,03 com 10 por cento de desconto"
+                nums = re.findall(r"[\d]+[.,][\d]+", texto)
+                if nums:
+                    try:
+                        v = nums[0].replace(".", "").replace(",", ".")
+                        preco = float(v)
+                        if preco > 0:
+                            log.info("Amazon Programe e Poupe: R$ %.2f", preco)
+                            return preco
+                    except Exception:
+                        pass
 
             # Fallback: preço normal
-            for sel in ["#priceblock_ourprice", "#priceblock_dealprice",
-                        "span.a-price-whole", ".a-price .a-offscreen"]:
+            for sel in [
+                "#priceblock_ourprice",
+                "#priceblock_dealprice",
+                ".a-price .a-offscreen",
+                "span.a-price-whole",
+            ]:
                 el = soup.select_one(sel)
                 if el:
                     texto = el.get("content") or el.get_text(strip=True)
-                    v = re.sub(r"[^\d,.]", "", texto).replace(".", "").replace(",", ".")
-                    if v:
+                    nums = re.findall(r"[\d]+[.,][\d]+", texto)
+                    if nums:
                         try:
-                            preco_normal = float(v)
-                            if preco_normal > 0:
-                                log.info("Amazon preço normal: R$ %.2f", preco_normal)
-                                return preco_normal
+                            v = nums[0].replace(".", "").replace(",", ".")
+                            preco = float(v)
+                            if preco > 0:
+                                log.info("Amazon preço normal: R$ %.2f", preco)
+                                return preco
                         except Exception:
                             pass
         for sel in ["[class*='price'] [class*='value']", "[class*='preco']", "[class*='price']"]:
