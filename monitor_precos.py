@@ -261,7 +261,7 @@ def extrair_preco_fornecedor(url: str) -> float | None:
 
         if "drogasil" in url or "drogaraia" in url:
             # Tenta Leve + Pague primeiro
-            el = soup.select_one(".floating-price-position")
+            el = soup.select_one(".floating-price-position-lmpm")
             if el:
                 nums = re.findall(r"[\d]+[.,][\d]{2}", el.get_text(strip=True))
                 if nums:
