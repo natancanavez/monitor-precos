@@ -443,6 +443,19 @@ def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
                 min_qtd=int(m.group(2)),
             ))
 
+        # 3. Leve mais, pague menos — acumula igual ao MpM
+        # Ex: "Economize 10% nas compras de 2 ou mais"
+        leve_mais_re = re.compile(
+            r'[Ee]conomize\s+(\d+)%\s+nas\s+compras\s+de\s+(\d+)\s+ou\s+mais',
+            re.IGNORECASE,
+        )
+        for m in leve_mais_re.finditer(texto_pagina):
+            descontos.append(Desconto(
+                tipo='leve_mais',
+                pct=float(m.group(1)) / 100,
+                min_qtd=int(m.group(2)),
+            ))
+
     # elif "outrofornecedor" in url: ...
 
     descontos = _deduplicar(descontos)
@@ -457,6 +470,8 @@ def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
             partes.append(f"{prime}{d.codigo} -R${d.fixo:.0f}≥R${d.min_valor:.0f}")
         elif d.tipo == 'mpm':
             partes.append(f"MpM {int(d.pct*100)}%≥{d.min_qtd}un")
+        elif d.tipo == 'leve_mais':
+            partes.append(f"LvM {int(d.pct*100)}%≥{d.min_qtd}un")
 
     texto_i = " | ".join(partes)
     if texto_i:
@@ -564,7 +579,7 @@ def calcular_melhor_preco_unitario(
       3. Cupom fixo → subtrai diretamente
     """
     tiers_mpm = sorted(
-        [(d.min_qtd, d.pct) for d in descontos if d.tipo == 'mpm'],
+        [(d.min_qtd, d.pct) for d in descontos if d.tipo in ('mpm', 'leve_mais')],
         key=lambda x: x[0]
     )
 
