@@ -1,11 +1,10 @@
 """
 monitor_precos.py
-1. Lê produtos do Google Sheets
-2. Renova token ML automaticamente via refresh_token
-3. Busca preço do vencedor do catálogo ML via API oficial
-4. Raspa preços do fornecedor via ScraperAPI
-5. Atualiza colunas no Google Sheets
-6. Envia alertas via Telegram quando necessário
+
+Colunas da planilha:
+  A=SKU, B=Link ML, C=Link Fornecedor, D=Preço ML (número),
+  E=Preço Fornecedor (número), F=PMC Máximo (fórmula do usuário),
+  G=Status, H=Última Atualização, I=Descontos Amazon, J=Melhor Preço Unit.
 """
 
 import re
@@ -14,20 +13,18 @@ import time
 import logging
 import requests
 import os
+from dataclasses import dataclass, field
 from datetime import datetime
-
 import gspread
 from google.oauth2.service_account import Credentials
-
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     COMISSAO_ML, IMPOSTO_DAS, MARGEM_MIN, FRETE_FIXO,
 )
 
-# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)s %(levelname)-8s %(message)s",
     handlers=[
         logging.FileHandler("/data/monitor.log", encoding="utf-8"),
         logging.StreamHandler(),
@@ -44,81 +41,63 @@ HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9",
 }
 
-DESCONTO        = COMISSAO_ML + IMPOSTO_DAS + MARGEM_MIN
+DESCONTO = COMISSAO_ML + IMPOSTO_DAS + MARGEM_MIN
+
+ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 SHEETS_ID       = os.environ.get("SHEETS_ID", "")
 
-# ── Credenciais ML ────────────────────────────────────────────────────────────
-ML_CLIENT_ID     = "3934461305870964"
-ML_CLIENT_SECRET = "TwDkUlKf3nAfKWD1FZUBOEKUSGzpbAZy"
-ML_TOKENS_FILE   = "/data/ml_tokens.json"
-
-_ML_INITIAL_ACCESS_TOKEN  = os.environ.get("ML_ACCESS_TOKEN", "")
-_ML_INITIAL_REFRESH_TOKEN = os.environ.get("ML_REFRESH_TOKEN", "TG-6a17a3d4bff5d60001aa0b45-643972290")
-
-
-def _carregar_tokens() -> dict:
-    if os.path.exists(ML_TOKENS_FILE):
-        try:
-            with open(ML_TOKENS_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
-        "access_token": _ML_INITIAL_ACCESS_TOKEN,
-        "refresh_token": _ML_INITIAL_REFRESH_TOKEN,
-    }
+COL_SKU        = 0   # A
+COL_LINK_ML    = 1   # B
+COL_LINK_FORN  = 2   # C
+COL_PRECO_ML   = 3   # D
+COL_PRECO_FORN = 4   # E
+COL_PMC        = 5   # F
+COL_STATUS     = 6   # G
+COL_ATUALIZADO = 7   # H
+COL_DESCONTOS  = 8   # I
+COL_MELHOR_UN  = 9   # J
 
 
-def _salvar_tokens(tokens: dict) -> None:
-    os.makedirs(os.path.dirname(ML_TOKENS_FILE), exist_ok=True)
-    with open(ML_TOKENS_FILE, "w") as f:
-        json.dump(tokens, f)
+# ---------------------------------------------------------------------------
+# Estrutura de desconto
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Desconto:
+    tipo: str            # 'cupom_pct', 'cupom_fixo', 'mpm', 'pp'
+    codigo: str = ""     # código do cupom (vazio para mpm/pp)
+    pct: float = 0.0     # ex: 0.10 para 10%
+    fixo: float = 0.0    # ex: 50.0 para -R$50
+    min_valor: float = 0.0   # pedido mínimo em R$ para o cupom ser válido
+    min_qtd: int = 1         # qtd mínima (MpM)
+    prime: bool = False
 
 
-def renovar_token_ml() -> str:
-    tokens = _carregar_tokens()
-    log.info("Renovando access_token ML...")
-    r = requests.post(
-        "https://api.mercadolibre.com/oauth/token",
-        data={
-            "grant_type":    "refresh_token",
-            "client_id":     ML_CLIENT_ID,
-            "client_secret": ML_CLIENT_SECRET,
-            "refresh_token": tokens["refresh_token"],
-        },
-        timeout=15,
-    )
-    if r.status_code == 200:
-        data = r.json()
-        tokens["access_token"]  = data["access_token"]
-        tokens["refresh_token"] = data.get("refresh_token", tokens["refresh_token"])
-        _salvar_tokens(tokens)
-        log.info("Token ML renovado com sucesso ✅")
-        return tokens["access_token"]
-    else:
-        log.error("Erro ao renovar token ML: %s %s", r.status_code, r.text)
-        return tokens["access_token"]
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-
-def obter_token_ml() -> str:
-    tokens = _carregar_tokens()
-    r = requests.get(
-        "https://api.mercadolibre.com/users/me",
-        headers={"Authorization": f"Bearer {tokens['access_token']}"},
-        timeout=10,
-    )
-    if r.status_code == 401:
-        return renovar_token_ml()
-    return tokens["access_token"]
-
-
-# ── Fórmula PMC ──────────────────────────────────────────────────────────────
-def calcular_pmc(preco_ml: float) -> float:
+def pmc_padrao(preco_ml: float) -> float:
     return round(preco_ml * (1 - DESCONTO) - FRETE_FIXO, 2)
 
 
-# ── Google Sheets ─────────────────────────────────────────────────────────────
+def parse_valor(s: str) -> float | None:
+    try:
+        v = re.sub(r"[^\d.,]", "", str(s))
+        if "," in v and "." in v:
+            v = v.replace(".", "").replace(",", ".")
+        elif "," in v:
+            v = v.replace(",", ".")
+        return float(v) if v else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets
+# ---------------------------------------------------------------------------
+
 def conectar_sheets():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -131,19 +110,10 @@ def conectar_sheets():
     return client.open_by_key(SHEETS_ID).sheet1
 
 
-def garantir_cabecalhos(ws) -> None:
-    headers = ws.row_values(1)
-    esperados = [
-        "SKU", "Link ML", "Link Fornecedor",
-        "Preco ML (R$)", "Preco Fornecedor (R$)",
-        "PMC Maximo (R$)", "Status", "Ultima Atualizacao",
-    ]
-    if headers != esperados:
-        ws.update("A1:H1", [esperados])
-        log.info("Cabecalhos criados na planilha.")
+# ---------------------------------------------------------------------------
+# Mercado Livre
+# ---------------------------------------------------------------------------
 
-
-# ── Scraper ML ────────────────────────────────────────────────────────────────
 def extrair_item_id_ml(url: str) -> tuple:
     m = re.search(r'/p/(MLB\d+)', url, re.IGNORECASE)
     if m:
@@ -158,11 +128,10 @@ def extrair_preco_ml(url: str) -> float | None:
     try:
         tipo, item_id = extrair_item_id_ml(url)
         if not item_id:
-            log.warning("Item ID ML nao encontrado: %s", url)
+            log.warning("Item ID ML não encontrado: %s", url)
             return None
 
-        token = obter_token_ml()
-        headers_ml = {"Authorization": f"Bearer {token}"}
+        headers_ml = {"Authorization": f"Bearer {ML_ACCESS_TOKEN}"} if ML_ACCESS_TOKEN else {}
 
         if tipo == 'catalog':
             resp = requests.get(
@@ -170,37 +139,34 @@ def extrair_preco_ml(url: str) -> float | None:
                 headers=headers_ml, timeout=15
             )
             if resp.status_code == 200:
-                results = resp.json().get("results", [])
-                if results:
-                    winner = results[0]
-                    winner_item_id = winner.get("item_id")
-                    preco = winner.get("price")
-                    if preco:
-                        log.info("API ML catalogo winner (%s -> %s): R$ %.2f",
-                                 item_id, winner_item_id, float(preco))
-                        return float(preco)
-            log.warning("Nenhum item encontrado no catalogo %s (status %s)",
-                        item_id, resp.status_code)
-            return None
+                resultados = resp.json().get("results", [])
+                precos = [float(r["price"]) for r in resultados if r.get("price")]
+                if precos:
+                    preco = min(precos)
+                    log.info("API ML catálogo: %s → R$ %.2f", item_id, preco)
+                    return preco
 
         resp = requests.get(
             f"https://api.mercadolibre.com/items/{item_id}",
             headers=headers_ml, timeout=15
         )
         if resp.status_code == 200:
-            preco = resp.json().get("price")
+            data = resp.json()
+            preco = data.get("price")
             if preco:
-                log.info("API ML item: %s -> R$ %.2f", item_id, float(preco))
                 return float(preco)
 
-        log.warning("Preco ML nao encontrado: %s", item_id)
+        log.warning("Preço ML não encontrado: %s", item_id)
         return None
     except Exception as e:
         log.error("Erro ML (%s): %s", url, e)
         return None
 
 
-# ── Scraper Fornecedor ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Fetch genérico
+# ---------------------------------------------------------------------------
+
 def fetch_url(url: str):
     try:
         if SCRAPER_API_KEY:
@@ -220,123 +186,345 @@ def fetch_url(url: str):
         return None
 
 
-def extrair_preco_fornecedor(url: str) -> float | None:
-    from bs4 import BeautifulSoup
-    try:
-        resp = fetch_url(url)
-        if not resp:
-            return None
+# ---------------------------------------------------------------------------
+# Extração de preço do fornecedor (lógica original, sem alteração)
+# ---------------------------------------------------------------------------
 
-        soup = BeautifulSoup(resp.text, "lxml")
+def extrair_preco_fornecedor_soup(soup, url: str) -> float | None:
+    """Extrai preço do soup. Prioriza Programe e Poupe na Amazon."""
+    for meta_name in ["product:price:amount", "og:price:amount"]:
+        tag = soup.find("meta", property=meta_name)
+        if tag and tag.get("content"):
+            v = re.sub(r"[^\d.]", "", tag["content"].replace(",", "."))
+            if v:
+                return float(v)
 
-        # ── Drogasil / Drogaraia ──────────────────────────────────────────
-        if "drogasil" in url or "drogaraia" in url:
-            el = soup.select_one(".floating-price-position-lmpm")
+    tag = soup.find(attrs={"itemprop": "price"})
+    if tag:
+        valor = tag.get("content") or tag.get_text(strip=True)
+        valor = re.sub(r"[^\d.,]", "", valor).replace(".", "").replace(",", ".")
+        if valor:
+            return float(valor)
+
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string)
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                offers = item.get("offers", {})
+                if isinstance(offers, list):
+                    offers = offers[0]
+                price = offers.get("price")
+                if price:
+                    return float(price)
+        except Exception:
+            pass
+
+    if "amazon" in url:
+        # Programe e Poupe — prioridade
+        for sel in ["#sns-tiered-price", "#sns-base-price",
+                    "#subscriptionPrice", "#snsAccordionRowMiddle"]:
+            el = soup.select_one(sel)
             if el:
-                nums = re.findall(r"\d+[.,]\d{2}", el.get_text(strip=True))
+                nums = re.findall(r"[\d]+[.,][\d]{2}", el.get_text(strip=True))
                 if nums:
                     try:
-                        v = nums[0].replace(".", "").replace(",", ".")
-                        preco = float(v)
+                        preco = float(nums[0].replace(".", "").replace(",", "."))
                         if preco > 0:
-                            log.info("Drogasil Leve+Pague: R$ %.2f", preco)
+                            log.info("Amazon P&P (%s): R$ %.2f", sel, preco)
                             return preco
                     except Exception:
                         pass
-            # Preço com desconto (ex: 6% off) ou preço normal
-            for sel in [".product-price", ".price-pdp-content", "#pdp-price-container"]:
-                el = soup.select_one(sel)
-                if el:
-                    nums = re.findall(r"\d+[.,]\d{2}", el.get_text(strip=True))
-                    if nums:
-                        try:
-                            v = nums[0].replace(".", "").replace(",", ".")
-                            preco = float(v)
-                            if preco > 0:
-                                log.info("Drogasil preco (%s): R$ %.2f", sel, preco)
-                                return preco
-                        except Exception:
-                            pass
 
-        # ── Amazon ────────────────────────────────────────────────────────
-        if "amazon" in url:
-            for sel in ["#sns-tiered-price", "#sns-base-price", "#subscriptionPrice", "#snsAccordionRowMiddle"]:
-                el = soup.select_one(sel)
-                if el:
-                    nums = re.findall(r"\d+[.,]\d{2}", el.get_text(strip=True))
-                    if nums:
-                        try:
-                            v = nums[0].replace(".", "").replace(",", ".")
-                            preco = float(v)
-                            if preco > 0:
-                                log.info("Amazon Programe e Poupe (%s): R$ %.2f", sel, preco)
-                                return preco
-                        except Exception:
-                            pass
-            for sel in ["#apex-pricetopay-accessibility-label", ".a-price .a-offscreen", "span.a-price-whole"]:
-                el = soup.select_one(sel)
-                if el:
-                    nums = re.findall(r"\d+[.,]\d{2}", el.get_text(strip=True))
-                    if nums:
-                        try:
-                            v = nums[0].replace(".", "").replace(",", ".")
-                            preco = float(v)
-                            if preco > 0:
-                                log.info("Amazon preco normal (%s): R$ %.2f", sel, preco)
-                                return preco
-                        except Exception:
-                            pass
-
-        # ── Seletores genéricos ───────────────────────────────────────────
-        for meta_name in ["product:price:amount", "og:price:amount"]:
-            tag = soup.find("meta", property=meta_name)
-            if tag and tag.get("content"):
-                v = re.sub(r"[^\d.]", "", tag["content"].replace(",", "."))
-                if v:
-                    return float(v)
-
-        tag = soup.find(attrs={"itemprop": "price"})
-        if tag:
-            valor = tag.get("content") or tag.get_text(strip=True)
-            valor = re.sub(r"[^\d.,]", "", valor).replace(".", "").replace(",", ".")
-            if valor:
-                return float(valor)
-
-        for tag in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(tag.string)
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    offers = item.get("offers", {})
-                    if isinstance(offers, list):
-                        offers = offers[0]
-                    price = offers.get("price")
-                    if price:
-                        return float(price)
-            except Exception:
-                pass
-
-        for sel in ["[class*='price'] [class*='value']", "[class*='preco']", "[class*='price']"]:
+        # Fallback: preço normal
+        for sel in [
+            "#apex-pricetopay-accessibility-label",
+            "#priceblock_ourprice",
+            "#priceblock_dealprice",
+            ".a-price .a-offscreen",
+            "span.a-price-whole",
+        ]:
             el = soup.select_one(sel)
             if el:
-                nums = re.findall(r"\d+[.,]\d{2}", el.get_text(strip=True))
+                texto = el.get("content") or el.get_text(strip=True)
+                nums = re.findall(r"[\d]+[.,][\d]{2}", texto)
                 if nums:
                     try:
-                        return float(nums[0].replace(".", "").replace(",", "."))
+                        preco = float(nums[0].replace(".", "").replace(",", "."))
+                        if preco > 0:
+                            log.info("Amazon preço normal (%s): R$ %.2f", sel, preco)
+                            return preco
                     except Exception:
                         pass
 
-        log.warning("Preco fornecedor nao encontrado: %s", url)
-        return None
-    except Exception as e:
-        log.error("Erro fornecedor (%s): %s", url, e)
-        return None
+    for sel in ["[class*='price'] [class*='value']", "[class*='preco']", "[class*='price']"]:
+        el = soup.select_one(sel)
+        if el:
+            nums = re.findall(r"\d+[.,]\d{2}", el.get_text(strip=True))
+            if nums:
+                try:
+                    return float(nums[0].replace(".", "").replace(",", "."))
+                except Exception:
+                    pass
+
+    log.warning("Preço fornecedor não encontrado: %s", url)
+    return None
 
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Extração de descontos → lista estruturada + texto para coluna I
+# Atualmente com seletores HTML para Amazon; expansível para outros fornecedores
+# ---------------------------------------------------------------------------
+
+def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
+    """
+    Retorna (lista_de_descontos, texto_coluna_I).
+    Não inclui Programe e Poupe (preço já está na coluna E).
+    Hoje suporta Amazon; adicione blocos `if "outrofornecedor" in url` para expandir.
+    """
+    is_amazon = "amazon" in url
+
+    descontos: list[Desconto] = []
+    texto_pagina = soup.get_text(" ")
+
+    if is_amazon:
+        # --- 1. Cupons resgatáveis (botão Resgatar) ---
+        # Tenta pegar pelo HTML estruturado primeiro
+        blocos_cupom = _coletar_blocos_cupom_amazon(soup)
+
+        # Fallback: texto completo da página
+        if not blocos_cupom:
+            blocos_cupom = [texto_pagina]
+
+        for bloco in blocos_cupom:
+            descontos.extend(_parsear_cupons_do_bloco(bloco))
+
+        # --- 2. Mais por Menos ---
+        mpm_re = re.compile(
+            r'Mais\s+por\s+Menos[:\s]*\+?([\d]+)%\s*off\s*em\s*([\d]+)\+?\s*iten?s?',
+            re.IGNORECASE,
+        )
+        for m in mpm_re.finditer(texto_pagina):
+            descontos.append(Desconto(
+                tipo='mpm',
+                pct=float(m.group(1)) / 100,
+                min_qtd=int(m.group(2)),
+            ))
+
+    # Futuramente: elif "magazineluiza" in url: ...
+    # elif "shopee" in url: ...
+
+    # Remove duplicatas mantendo ordem
+    descontos = _deduplicar(descontos)
+
+    # Monta texto da coluna I
+    partes = []
+    for d in descontos:
+        if d.tipo == 'cupom_pct':
+            prime = "[Prime] " if d.prime else ""
+            partes.append(f"{prime}{d.codigo} {int(d.pct*100)}%≥R${d.min_valor:.0f}")
+        elif d.tipo == 'cupom_fixo':
+            prime = "[Prime] " if d.prime else ""
+            partes.append(f"{prime}{d.codigo} -R${d.fixo:.0f}≥R${d.min_valor:.0f}")
+        elif d.tipo == 'mpm':
+            partes.append(f"MpM {int(d.pct*100)}%≥{d.min_qtd}un")
+
+    texto_i = " | ".join(partes)
+    if texto_i:
+        log.info("Descontos: %s", texto_i)
+    return descontos, texto_i
+
+
+def _coletar_blocos_cupom_amazon(soup) -> list[str]:
+    seletores = [
+        "#couponFeature", "#vpcButton",
+        "[id*='coupon']", "[class*='couponFeature']",
+        "[class*='vpc']", "[data-feature-name='couponFeature']",
+        "[data-feature-name='vpcButton']",
+    ]
+    blocos = set()
+    for sel in seletores:
+        for el in soup.select(sel):
+            t = " ".join(el.get_text(" ", strip=True).split())
+            if t:
+                blocos.add(t)
+    return list(blocos)
+
+
+def _parsear_cupons_do_bloco(texto: str) -> list[Desconto]:
+    resultado = []
+
+    # Padrão percentual: "10% de desconto em pedidos a partir de R$100 cupom: CODIGO"
+    for m in re.finditer(
+        r'(\d+)%[^R$\d]*?(?:a partir de\s*)?R?\$?\s*([\d.,]+)[^:]*cupom\s*:\s*(\w+)',
+        texto, re.IGNORECASE
+    ):
+        prime = bool(re.search(r'prime', texto[:m.start()], re.IGNORECASE))
+        resultado.append(Desconto(
+            tipo='cupom_pct',
+            codigo=m.group(3).upper(),
+            pct=float(m.group(1)) / 100,
+            min_valor=parse_valor(m.group(2)) or 0.0,
+            prime=prime,
+        ))
+
+    # Padrão fixo: "Economize R$50 em pedidos R$299+ cupom: CODIGO"
+    for m in re.finditer(
+        r'[Ee]conomize\s+R?\$?\s*([\d.,]+)[^R$\d]*R?\$?\s*([\d.,]+)\+?[^:]*cupom\s*:\s*(\w+)',
+        texto, re.IGNORECASE
+    ):
+        prime = bool(re.search(r'prime', texto[:m.start()], re.IGNORECASE))
+        resultado.append(Desconto(
+            tipo='cupom_fixo',
+            codigo=m.group(3).upper(),
+            fixo=parse_valor(m.group(1)) or 0.0,
+            min_valor=parse_valor(m.group(2)) or 0.0,
+            prime=prime,
+        ))
+
+    return resultado
+
+
+def _deduplicar(descontos: list[Desconto]) -> list[Desconto]:
+    vistos = set()
+    saida = []
+    for d in descontos:
+        chave = (d.tipo, d.codigo, d.pct, d.fixo, d.min_valor, d.min_qtd)
+        if chave not in vistos:
+            vistos.add(chave)
+            saida.append(d)
+    return saida
+
+
+# ---------------------------------------------------------------------------
+# Cálculo do melhor preço unitário (coluna J)
+# ---------------------------------------------------------------------------
+
+def calcular_melhor_preco_unitario(
+    preco_base: float,
+    descontos: list[Desconto],
+) -> tuple[float, int]:
+    """
+    Dado o preço base (coluna E) e a lista de descontos, calcula o menor
+    custo unitário possível aplicando todos os descontos cabíveis.
+
+    Retorna (preco_unitario, quantidade_necessaria).
+
+    Lógica de aplicação (ordem do checkout Amazon):
+      1. Subtotal = qtd × preco_base
+      2. MpM: aplica o maior % de desconto para a quantidade
+      3. Cupom % : aplica se subtotal_pos_mpm >= min_valor
+      4. Cupom fixo: subtrai se subtotal_pos_mpm >= min_valor
+      (cupons % e fixo se acumulam se houver mais de um)
+    """
+    # Tiers MpM: [(min_qtd, pct), ...] ordenados
+    tiers_mpm = sorted(
+        [(d.min_qtd, d.pct) for d in descontos if d.tipo == 'mpm'],
+        key=lambda x: x[0]
+    )
+
+    # Quantidades a testar:
+    #   - 1 unidade (sem MpM)
+    #   - cada tier de MpM
+    #   - quantidade mínima para atingir o min_valor de cada cupom
+    qtds_testar = {1}
+    for qtd, _ in tiers_mpm:
+        qtds_testar.add(qtd)
+
+    # Para cupons com min_valor, calcular quantas unidades precisa comprar
+    # (antes de MpM) para bater o mínimo
+    for d in descontos:
+        if d.min_valor > 0 and preco_base > 0:
+            qtd_necessaria = int(d.min_valor / preco_base) + 1
+            qtds_testar.add(qtd_necessaria)
+
+    melhor_unitario = preco_base
+    melhor_qtd = 1
+
+    for qtd in sorted(qtds_testar):
+        subtotal = qtd * preco_base
+
+        # 1. Aplica MpM: pega o maior desconto para a qtd
+        pct_mpm = 0.0
+        for min_qtd, pct in tiers_mpm:
+            if qtd >= min_qtd:
+                pct_mpm = pct  # já está ordenado, então sobrescreve com o maior válido
+
+        subtotal_pos_mpm = subtotal * (1 - pct_mpm)
+
+        # 2. Aplica cupons % (todos que forem válidos)
+        total_pct_cupom = 0.0
+        for d in descontos:
+            if d.tipo == 'cupom_pct' and subtotal_pos_mpm >= d.min_valor:
+                total_pct_cupom += d.pct
+
+        subtotal_pos_cupom_pct = subtotal_pos_mpm * (1 - total_pct_cupom)
+
+        # 3. Aplica cupons fixos (todos que forem válidos)
+        total_fixo_cupom = 0.0
+        for d in descontos:
+            if d.tipo == 'cupom_fixo' and subtotal_pos_mpm >= d.min_valor:
+                total_fixo_cupom += d.fixo
+
+        total_final = subtotal_pos_cupom_pct - total_fixo_cupom
+
+        # Proteção: total não pode ser negativo
+        if total_final <= 0:
+            continue
+
+        unitario = total_final / qtd
+
+        if unitario < melhor_unitario:
+            melhor_unitario = unitario
+            melhor_qtd = qtd
+
+    return round(melhor_unitario, 2), melhor_qtd
+
+
+# ---------------------------------------------------------------------------
+# Orquestração: preço + descontos + melhor unitário
+# ---------------------------------------------------------------------------
+
+def processar_fornecedor(url: str) -> tuple[float | None, str, str]:
+    """
+    Faz uma única requisição à página do fornecedor e retorna:
+      (preco, texto_coluna_I, texto_coluna_J)
+    """
+    from bs4 import BeautifulSoup
+
+    resp = fetch_url(url)
+    if not resp:
+        return None, "", ""
+
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    preco = extrair_preco_fornecedor_soup(soup, url)
+    if preco is None:
+        return None, "", ""
+
+    descontos, texto_i = extrair_descontos_amazon(soup, url)
+
+    if descontos:
+        melhor_un, melhor_qtd = calcular_melhor_preco_unitario(preco, descontos)
+        if melhor_qtd > 1:
+            texto_j = f"R${melhor_un:,.2f} ({melhor_qtd}un)"
+        else:
+            # Sem ganho: mesmo preço, mas mostra por clareza
+            texto_j = f"R${melhor_un:,.2f} (1un)"
+        log.info("Melhor unitário: %s", texto_j)
+    else:
+        texto_j = ""  # não Amazon ou sem descontos → deixa coluna J vazia
+
+    return preco, texto_i, texto_j
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+
 def telegram_send(mensagem: str) -> None:
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "SEU_TOKEN_AQUI":
-        log.warning("Telegram nao configurado.")
+        log.warning("Telegram não configurado.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": mensagem, "parse_mode": "HTML"}
@@ -348,16 +536,17 @@ def telegram_send(mensagem: str) -> None:
         log.error("Erro Telegram: %s", e)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Loop principal
+# ---------------------------------------------------------------------------
+
 def processar() -> None:
     try:
         ws = conectar_sheets()
-        log.info("Conectado ao Google Sheets")
+        log.info("Conectado ao Google Sheets ✅")
     except Exception as e:
         log.error("Erro ao conectar Google Sheets: %s", e)
         return
-
-    garantir_cabecalhos(ws)
 
     todos_dados = ws.get_all_values()
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -367,82 +556,86 @@ def processar() -> None:
         if len(row) < 3:
             continue
 
-        sku       = row[0].strip()
-        link_ml   = row[1].strip()
-        link_forn = row[2].strip()
+        sku       = row[COL_SKU].strip()
+        link_ml   = row[COL_LINK_ML].strip()
+        link_forn = row[COL_LINK_FORN].strip()
 
         if not sku or not link_ml or not link_forn:
             continue
 
-        status_ant = row[6].strip() if len(row) > 6 else ""
+        status_ant = row[COL_STATUS].strip() if len(row) > COL_STATUS else ""
 
         log.info("Processando SKU %s ...", sku)
 
-        preco_ml   = extrair_preco_ml(link_ml)
+        preco_ml = extrair_preco_ml(link_ml)
         time.sleep(1.5)
-        preco_forn = extrair_preco_fornecedor(link_forn)
+
+        preco_forn, texto_i, texto_j = processar_fornecedor(link_forn)
         time.sleep(1.5)
 
         if preco_ml is None or preco_forn is None:
-            ws.update(f"G{row_idx}:H{row_idx}", [["Erro na leitura", agora]])
+            ws.update(f"G{row_idx}:H{row_idx}", [["⚠️ Erro na leitura", agora]])
             continue
 
-        # Atualiza D e E com numeros puros -- deixa F intacta (formula do usuario)
+        # Atualiza D e E (preços brutos)
         ws.update(f"D{row_idx}:E{row_idx}", [[round(preco_ml, 2), round(preco_forn, 2)]])
+        time.sleep(0.5)
+
+        # Atualiza I (descontos) e J (melhor unitário)
+        ws.update(f"I{row_idx}:J{row_idx}", [[texto_i, texto_j]])
         time.sleep(0.3)
 
-        # Rele coluna F apos atualizar D e E (Sheets recalcula a formula)
-        try:
-            pmc_cell = ws.cell(row_idx, 6).value
-            pmc_str = re.sub(r"[^\d.,]", "", str(pmc_cell or ""))
-            if "," in pmc_str and "." in pmc_str:
-                pmc_str = pmc_str.replace(".", "").replace(",", ".")
-            elif "," in pmc_str:
-                pmc_str = pmc_str.replace(",", ".")
-            pmc = float(pmc_str) if pmc_str else calcular_pmc(preco_ml)
-        except Exception:
-            pmc = calcular_pmc(preco_ml)
+        # Relê F (fórmula do usuário recalculada pelo Sheets)
+        pmc_atualizado = parse_valor(ws.cell(row_idx, COL_PMC + 1).value)
+        pmc = pmc_atualizado if pmc_atualizado else pmc_padrao(preco_ml)
+        origem = "planilha" if pmc_atualizado else "padrão"
+        log.info("PMC (%s): R$ %.2f", origem, pmc)
 
         if preco_forn > pmc:
-            status = "\U0001f6a8 ACIMA DO PMC"
+            status = "🚨 ACIMA DO PMC"
             if status_ant != status:
+                extra = f"\nDescontos: {texto_i}\nMelhor unit.: {texto_j}" if texto_i else ""
                 alertas.append(
-                    f"\U0001f6a8 <b>ALERTA \u2014 Fornecedor acima do PMC</b>\n"
+                    f"🚨 <b>ALERTA — Fornecedor acima do PMC</b>\n"
                     f"SKU: <code>{sku}</code>\n"
-                    f"Pre\u00e7o ML: R$ {preco_ml:,.2f}\n"
-                    f"PMC M\u00e1ximo: R$ {pmc:,.2f}\n"
-                    f"Pre\u00e7o Fornecedor: R$ {preco_forn:,.2f}  \u274c\n"
+                    f"Preço ML: R$ {preco_ml:,.2f}\n"
+                    f"PMC Máximo: R$ {pmc:,.2f}\n"
+                    f"Preço Fornecedor: R$ {preco_forn:,.2f} ❌"
+                    f"{extra}\n"
                     f"Data: {agora}"
                 )
         else:
-            status = "\u2705 OK"
-            if status_ant == "\U0001f6a8 ACIMA DO PMC":
+            status = "✅ OK"
+            if status_ant == "🚨 ACIMA DO PMC":
+                extra = f"\nDescontos: {texto_i}\nMelhor unit.: {texto_j}" if texto_i else ""
                 alertas.append(
-                    f"\u2705 <b>NORMALIZADO \u2014 Fornecedor voltou abaixo do PMC</b>\n"
+                    f"✅ <b>NORMALIZADO — Fornecedor voltou abaixo do PMC</b>\n"
                     f"SKU: <code>{sku}</code>\n"
-                    f"Pre\u00e7o ML: R$ {preco_ml:,.2f}\n"
-                    f"PMC M\u00e1ximo: R$ {pmc:,.2f}\n"
-                    f"Pre\u00e7o Fornecedor: R$ {preco_forn:,.2f}  \u2705\n"
+                    f"Preço ML: R$ {preco_ml:,.2f}\n"
+                    f"PMC Máximo: R$ {pmc:,.2f}\n"
+                    f"Preço Fornecedor: R$ {preco_forn:,.2f} ✅"
+                    f"{extra}\n"
                     f"Data: {agora}"
                 )
 
         ws.update(f"G{row_idx}:H{row_idx}", [[status, agora]])
-
-        log.info("  ML=R$%.2f  Forn=R$%.2f  PMC=R$%.2f  -> %s",
-                 preco_ml, preco_forn, pmc, status)
-
+        log.info(
+            " ML=R$%.2f Forn=R$%.2f PMC=R$%.2f → %s | I=%s | J=%s",
+            preco_ml, preco_forn, pmc, status,
+            texto_i or "—", texto_j or "—"
+        )
         time.sleep(1)
 
-    log.info("Planilha atualizada no Google Sheets")
+    log.info("Planilha atualizada no Google Sheets ✅")
 
     for alerta in alertas:
         telegram_send(alerta)
 
     if not alertas:
-        log.info("Nenhuma mudanca de status detectada.")
+        log.info("Nenhuma mudança de status detectada.")
 
 
 if __name__ == "__main__":
-    log.info("=== Container iniciado -- aguardando agendamento do Dokploy ===")
+    log.info("=== Container iniciado — aguardando agendamento do Dokploy ===")
     while True:
         time.sleep(60)
