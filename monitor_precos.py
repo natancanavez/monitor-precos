@@ -404,25 +404,25 @@ def processar() -> None:
             pmc = calcular_pmc(preco_ml)
 
         if preco_forn > pmc:
-            status = "ACIMA DO PMC"
+            status = "\U0001f6a8 ACIMA DO PMC"
             if status_ant != status:
                 alertas.append(
-                    f"ALERTA -- Fornecedor acima do PMC\n"
-                    f"SKU: {sku}\n"
-                    f"Preco ML: R$ {preco_ml:,.2f}\n"
-                    f"PMC Maximo: R$ {pmc:,.2f}\n"
-                    f"Preco Fornecedor: R$ {preco_forn:,.2f}\n"
+                    f"\U0001f6a8 <b>ALERTA \u2014 Fornecedor acima do PMC</b>\n"
+                    f"SKU: <code>{sku}</code>\n"
+                    f"Pre\u00e7o ML: R$ {preco_ml:,.2f}\n"
+                    f"PMC M\u00e1ximo: R$ {pmc:,.2f}\n"
+                    f"Pre\u00e7o Fornecedor: R$ {preco_forn:,.2f}  \u274c\n"
                     f"Data: {agora}"
                 )
         else:
-            status = "OK"
-            if status_ant == "ACIMA DO PMC":
+            status = "\u2705 OK"
+            if status_ant == "\U0001f6a8 ACIMA DO PMC":
                 alertas.append(
-                    f"NORMALIZADO -- Fornecedor voltou abaixo do PMC\n"
-                    f"SKU: {sku}\n"
-                    f"Preco ML: R$ {preco_ml:,.2f}\n"
-                    f"PMC Maximo: R$ {pmc:,.2f}\n"
-                    f"Preco Fornecedor: R$ {preco_forn:,.2f}\n"
+                    f"\u2705 <b>NORMALIZADO \u2014 Fornecedor voltou abaixo do PMC</b>\n"
+                    f"SKU: <code>{sku}</code>\n"
+                    f"Pre\u00e7o ML: R$ {preco_ml:,.2f}\n"
+                    f"PMC M\u00e1ximo: R$ {pmc:,.2f}\n"
+                    f"Pre\u00e7o Fornecedor: R$ {preco_forn:,.2f}  \u2705\n"
                     f"Data: {agora}"
                 )
 
