@@ -231,34 +231,6 @@ def extrair_preco_fornecedor(url: str) -> float | None:
 
         soup = BeautifulSoup(resp.text, "lxml")
 
-        for meta_name in ["product:price:amount", "og:price:amount"]:
-            tag = soup.find("meta", property=meta_name)
-            if tag and tag.get("content"):
-                v = re.sub(r"[^\d.]", "", tag["content"].replace(",", "."))
-                if v:
-                    return float(v)
-
-        tag = soup.find(attrs={"itemprop": "price"})
-        if tag:
-            valor = tag.get("content") or tag.get_text(strip=True)
-            valor = re.sub(r"[^\d.,]", "", valor).replace(".", "").replace(",", ".")
-            if valor:
-                return float(valor)
-
-        for tag in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(tag.string)
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    offers = item.get("offers", {})
-                    if isinstance(offers, list):
-                        offers = offers[0]
-                    price = offers.get("price")
-                    if price:
-                        return float(price)
-            except Exception:
-                pass
-
         if "drogasil" in url or "drogaraia" in url:
             # Tenta Leve + Pague primeiro
             el = soup.select_one(".floating-price-position-lmpm")
@@ -286,6 +258,34 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                             return preco
                     except Exception:
                         pass
+
+        for meta_name in ["product:price:amount", "og:price:amount"]:
+            tag = soup.find("meta", property=meta_name)
+            if tag and tag.get("content"):
+                v = re.sub(r"[^\d.]", "", tag["content"].replace(",", "."))
+                if v:
+                    return float(v)
+
+        tag = soup.find(attrs={"itemprop": "price"})
+        if tag:
+            valor = tag.get("content") or tag.get_text(strip=True)
+            valor = re.sub(r"[^\d.,]", "", valor).replace(".", "").replace(",", ".")
+            if valor:
+                return float(valor)
+
+        for tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(tag.string)
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    offers = item.get("offers", {})
+                    if isinstance(offers, list):
+                        offers = offers[0]
+                    price = offers.get("price")
+                    if price:
+                        return float(price)
+            except Exception:
+                pass
 
         if "amazon" in url:
             sns_seletores = ["#sns-tiered-price", "#sns-base-price", "#subscriptionPrice", "#snsAccordionRowMiddle"]
