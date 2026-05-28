@@ -3,8 +3,9 @@ monitor_precos.py
 1. Lê produtos do Google Sheets
 2. Raspa preços do ML via API oficial
 3. Raspa preços do fornecedor via ScraperAPI
-4. Atualiza colunas 4-6 no Google Sheets
-5. Envia alertas via Telegram quando necessário
+4. Calcula PMC via fórmula da planilha (col G) ou padrão
+5. Atualiza colunas no Google Sheets
+6. Envia alertas via Telegram quando necessário
 """
  
 import re
@@ -48,8 +49,32 @@ ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 SHEETS_ID       = os.environ.get("SHEETS_ID", "")
  
+# ── Colunas ───────────────────────────────────────────────────────────────────
+COL_SKU        = 0   # A
+COL_LINK_ML    = 1   # B
+COL_LINK_FORN  = 2   # C
+COL_PRECO_ML   = 3   # D
+COL_PRECO_FORN = 4   # E
+COL_PMC        = 5   # F
+COL_FORMULA    = 6   # G ← fórmula personalizada
+COL_STATUS     = 7   # H
+COL_ATUALIZADO = 8   # I
+ 
 # ── Fórmula PMC ──────────────────────────────────────────────────────────────
-def calcular_pmc(preco_ml: float) -> float:
+def calcular_pmc(preco_ml: float, formula_valor: str = "") -> float:
+    """
+    Se formula_valor for um número válido (calculado pelo Sheets), usa ele.
+    Senão, usa a fórmula padrão.
+    """
+    if formula_valor:
+        try:
+            # Remove R$, espaços e converte vírgula para ponto
+            v = re.sub(r"[^\d.,]", "", str(formula_valor)).replace(",", ".")
+            if v:
+                return round(float(v), 2)
+        except Exception:
+            pass
+    # Fórmula padrão
     return round(preco_ml * (1 - DESCONTO) - FRETE_FIXO, 2)
  
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -69,12 +94,12 @@ def garantir_cabecalhos(ws) -> None:
     headers = ws.row_values(1)
     esperados = [
         "SKU", "Link ML", "Link Fornecedor",
-        "Preço ML (R$)", "Preço Fornecedor (R$)",
-        "PMC Máximo (R$)", "Status", "Última Atualização",
+        "Preço ML (R$)", "Preço Fornecedor (R$)", "PMC Calculado (R$)",
+        "Fórmula PMC", "Status", "Última Atualização",
     ]
     if headers != esperados:
-        ws.update("A1:H1", [esperados])
-        log.info("Cabeçalhos criados na planilha.")
+        ws.update("A1:I1", [esperados])
+        log.info("Cabeçalhos atualizados na planilha.")
  
  
 # ── Scraper ML ────────────────────────────────────────────────────────────────
@@ -235,6 +260,7 @@ def processar() -> None:
  
     garantir_cabecalhos(ws)
  
+    # Busca todos os valores (fórmulas já calculadas pelo Sheets)
     todos_dados = ws.get_all_values()
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
     alertas = []
@@ -243,15 +269,16 @@ def processar() -> None:
         if len(row) < 3:
             continue
  
-        sku       = row[0].strip()
-        link_ml   = row[1].strip()
-        link_forn = row[2].strip()
+        sku       = row[COL_SKU].strip()
+        link_ml   = row[COL_LINK_ML].strip()
+        link_forn = row[COL_LINK_FORN].strip()
  
         if not sku or not link_ml or not link_forn:
             continue
  
-        # Status anterior
-        status_ant = row[6].strip() if len(row) > 6 else ""
+        # Fórmula PMC personalizada (col G) — já calculada pelo Sheets
+        formula_val = row[COL_FORMULA].strip() if len(row) > COL_FORMULA else ""
+        status_ant  = row[COL_STATUS].strip() if len(row) > COL_STATUS else ""
  
         log.info("Processando SKU %s ...", sku)
  
@@ -261,10 +288,11 @@ def processar() -> None:
         time.sleep(1.5)
  
         if preco_ml is None or preco_forn is None:
-            ws.update(f"G{row_idx}:H{row_idx}", [["⚠️ Erro na leitura", agora]])
+            ws.update(f"H{row_idx}:I{row_idx}", [["⚠️ Erro na leitura", agora]])
             continue
  
-        pmc = calcular_pmc(preco_ml)
+        # PMC: usa valor da coluna G se disponível, senão fórmula padrão
+        pmc = calcular_pmc(preco_ml, formula_val)
  
         if preco_forn > pmc:
             status = "🚨 ACIMA DO PMC"
@@ -289,18 +317,18 @@ def processar() -> None:
                     f"Data: {agora}"
                 )
  
-        ws.update(f"D{row_idx}:H{row_idx}", [[
+        # Atualiza D, E, F, H, I (não toca em G que é a fórmula do usuário)
+        ws.update(f"D{row_idx}:F{row_idx}", [[
             f"R$ {preco_ml:.2f}",
             f"R$ {preco_forn:.2f}",
             f"R$ {pmc:.2f}",
-            status,
-            agora,
         ]])
+        ws.update(f"H{row_idx}:I{row_idx}", [[status, agora]])
  
         log.info("  ML=R$%.2f  Forn=R$%.2f  PMC=R$%.2f  → %s",
                  preco_ml, preco_forn, pmc, status)
  
-        time.sleep(1)  # Evita rate limit do Sheets
+        time.sleep(1)
  
     log.info("Planilha atualizada no Google Sheets ✅")
  
