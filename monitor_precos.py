@@ -176,20 +176,27 @@ def extrair_preco_fornecedor(url: str) -> float | None:
             except Exception:
                 pass
         if "amazon" in url:
-            # Tenta Programe e Poupe via #subscriptionPrice
-            el = soup.select_one("#subscriptionPrice")
-            if el:
-                texto = el.get_text(strip=True)
-                nums = re.findall(r"[\d]+[.,][\d]+", texto)
-                if nums:
-                    try:
-                        v = nums[0].replace(".", "").replace(",", ".")
-                        preco = float(v)
-                        if preco > 0:
-                            log.info("Amazon Programe e Poupe: R$ %.2f", preco)
-                            return preco
-                    except Exception:
-                        pass
+            # Tenta Programe e Poupe — múltiplos seletores em ordem de prioridade
+            sns_seletores = [
+                "#sns-tiered-price",
+                "#sns-base-price",
+                "#subscriptionPrice",
+                "#snsAccordionRowMiddle",
+            ]
+            for sel in sns_seletores:
+                el = soup.select_one(sel)
+                if el:
+                    texto = el.get_text(strip=True)
+                    nums = re.findall(r"[\d]+[.,][\d]{2}", texto)
+                    if nums:
+                        try:
+                            v = nums[0].replace(".", "").replace(",", ".")
+                            preco = float(v)
+                            if preco > 0:
+                                log.info("Amazon Programe e Poupe (%s): R$ %.2f", sel, preco)
+                                return preco
+                        except Exception:
+                            pass
 
             # Fallback: preço normal
             for sel in [
@@ -202,13 +209,13 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                 el = soup.select_one(sel)
                 if el:
                     texto = el.get("content") or el.get_text(strip=True)
-                    nums = re.findall(r"[\d]+[.,][\d]+", texto)
+                    nums = re.findall(r"[\d]+[.,][\d]{2}", texto)
                     if nums:
                         try:
                             v = nums[0].replace(".", "").replace(",", ".")
                             preco = float(v)
                             if preco > 0:
-                                log.info("Amazon preço normal: R$ %.2f", preco)
+                                log.info("Amazon preço normal (%s): R$ %.2f", sel, preco)
                                 return preco
                         except Exception:
                             pass
