@@ -494,8 +494,9 @@ def _parsear_cupons_do_bloco(texto: str) -> list[Desconto]:
         texto, re.IGNORECASE
     ):
         trecho = m.group(0)
-        vals = re.findall(r'[\d.,]+', trecho)
-        # Último número no trecho é o valor mínimo do pedido
+        # Busca min_valor ANTES de "cupom:" para não pegar dígitos do código
+        pre_cupom = trecho[:trecho.lower().rfind('cupom')]
+        vals = re.findall(r'[\d.,]+', pre_cupom)
         min_val = parse_valor(vals[-1]) if len(vals) > 1 else 0.0
         ctx = texto[max(0, m.start()-200):m.start()]
         prime = bool(re.search(r'prime', ctx, re.IGNORECASE))
@@ -513,8 +514,9 @@ def _parsear_cupons_do_bloco(texto: str) -> list[Desconto]:
         texto, re.IGNORECASE
     ):
         trecho = m.group(0)
-        vals = re.findall(r'[\d.,]+', trecho)
-        # group(1) = valor do desconto; último número = valor mínimo do pedido
+        # Busca min_valor ANTES de "cupom:" para não pegar dígitos do código
+        pre_cupom = trecho[:trecho.lower().rfind('cupom')]
+        vals = re.findall(r'[\d.,]+', pre_cupom)
         min_val = parse_valor(vals[-1]) if len(vals) >= 2 else 0.0
         ctx = texto[max(0, m.start()-200):m.start()]
         prime = bool(re.search(r'prime', ctx, re.IGNORECASE))
@@ -581,25 +583,29 @@ def calcular_melhor_preco_unitario(
     for qtd in sorted(qtds_testar):
         subtotal = qtd * preco_original
 
-        # MpM acumulativo: soma todos os tiers válidos para a quantidade
+        # MpM: acumula todos os tiers válidos (mecanismo separado de cupons)
         pct_mpm_total = sum(pct for min_qtd, pct in tiers_mpm if qtd >= min_qtd)
 
-        # Cupons % acumulativos
-        pct_cupom_total = sum(
-            d.pct for d in descontos
-            if d.tipo == 'cupom_pct' and subtotal >= d.min_valor
+        # P&P: mecanismo separado, sempre aplica
+        pct_pp = next(
+            (d.pct for d in descontos if d.tipo == 'cupom_pct' and d.codigo == 'P&P'),
+            0.0
         )
 
-        # Total % de desconto (sobre subtotal original)
-        pct_total = pct_mpm_total + pct_cupom_total
+        # Cupons (% ou fixo): Amazon aplica apenas o de maior VALOR entre os aplicáveis
+        cupons_aplicaveis = []
+        for d in descontos:
+            if d.codigo == 'P&P':
+                continue
+            if d.tipo == 'cupom_pct' and subtotal >= d.min_valor:
+                cupons_aplicaveis.append(subtotal * d.pct)  # valor do desconto em R$
+            elif d.tipo == 'cupom_fixo' and subtotal >= d.min_valor:
+                cupons_aplicaveis.append(d.fixo)
+        melhor_cupom_valor = max(cupons_aplicaveis) if cupons_aplicaveis else 0.0
 
-        # Cupons fixos
-        fixo_total = sum(
-            d.fixo for d in descontos
-            if d.tipo == 'cupom_fixo' and subtotal >= d.min_valor
-        )
-
-        total_final = subtotal * (1 - pct_total) - fixo_total
+        # Total aplicado sobre o subtotal
+        subtotal_pos_descontos = subtotal * (1 - pct_mpm_total - pct_pp)
+        total_final = subtotal_pos_descontos - melhor_cupom_valor
 
         if total_final <= 0:
             continue
