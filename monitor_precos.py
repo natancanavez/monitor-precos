@@ -338,8 +338,12 @@ def processar() -> None:
             continue
 
         # Relê coluna F após atualizar D e E (Sheets recalcula a fórmula)
-        pmc_cell = ws.cell(row_idx, 6).value
-        pmc = float(re.sub(r"[^\d.,]", "", str(pmc_cell)).replace(".", "").replace(",", ".")) if pmc_cell else calcular_pmc(preco_ml)
+        try:
+            pmc_cell = ws.cell(row_idx, 6).value
+            pmc_str = re.sub(r"[^\d.,]", "", str(pmc_cell or "")).replace(".", "").replace(",", ".")
+            pmc = float(pmc_str) if pmc_str else calcular_pmc(preco_ml)
+        except Exception:
+            pmc = calcular_pmc(preco_ml)
 
         if preco_forn > pmc:
             status = "🚨 ACIMA DO PMC"
