@@ -1,15 +1,9 @@
 """
 monitor_precos.py
-1. Lê produtos do Google Sheets
-2. Raspa preços do ML via API oficial
-3. Raspa preços do fornecedor via ScraperAPI
-4. Calcula PMC via fórmula da planilha (col G) ou padrão
-5. Atualiza colunas no Google Sheets
-6. Envia alertas via Telegram quando necessário
- 
 Colunas da planilha:
-A=SKU, B=Link ML, C=Link Fornecedor, D=Preço ML, E=Preço Forn,
-F=PMC Calculado, G=Fórmula PMC (usuário), H=Status, I=Última Atualização
+A=SKU, B=Link ML, C=Link Fornecedor, D=Preço ML (número),
+E=Preço Fornecedor (número), F=PMC Máximo (fórmula do usuário),
+G=Status, H=Última Atualização
 """
  
 import re
@@ -28,7 +22,6 @@ from config import (
     COMISSAO_ML, IMPOSTO_DAS, MARGEM_MIN, FRETE_FIXO,
 )
  
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -53,33 +46,31 @@ ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 SHEETS_ID       = os.environ.get("SHEETS_ID", "")
  
-# ── Índices das colunas (0-based) ─────────────────────────────────────────────
 COL_SKU        = 0   # A
 COL_LINK_ML    = 1   # B
 COL_LINK_FORN  = 2   # C
-COL_PRECO_ML   = 3   # D
-COL_PRECO_FORN = 4   # E
-COL_PMC        = 5   # F
-COL_FORMULA    = 6   # G ← fórmula personalizada do usuário
-COL_STATUS     = 7   # H
-COL_ATUALIZADO = 8   # I
+COL_PRECO_ML   = 3   # D — número puro, usado nas fórmulas do Sheets
+COL_PRECO_FORN = 4   # E — número puro
+COL_PMC        = 5   # F — fórmula do usuário (ex: =D2*0.72-20)
+COL_STATUS     = 6   # G
+COL_ATUALIZADO = 7   # H
  
-# ── Fórmula PMC ───────────────────────────────────────────────────────────────
-def calcular_pmc(preco_ml: float, formula_valor: str = "") -> float:
-    """
-    Se formula_valor for um número válido (calculado pelo Sheets), usa ele.
-    Senão, usa a fórmula padrão: Preço ML × (1 - desconto) - frete.
-    """
-    if formula_valor:
-        try:
-            v = re.sub(r"[^\d.,]", "", str(formula_valor)).replace(".", "").replace(",", ".")
-            if v:
-                return round(float(v), 2)
-        except Exception:
-            pass
+def pmc_padrao(preco_ml: float) -> float:
     return round(preco_ml * (1 - DESCONTO) - FRETE_FIXO, 2)
  
-# ── Google Sheets ─────────────────────────────────────────────────────────────
+def parse_valor(s: str) -> float | None:
+    """Converte string de valor (ex: '71.17', 'R$ 71,17') para float."""
+    try:
+        v = re.sub(r"[^\d.,]", "", str(s))
+        # Se tiver vírgula e ponto, formato brasileiro: 1.234,56
+        if "," in v and "." in v:
+            v = v.replace(".", "").replace(",", ".")
+        elif "," in v:
+            v = v.replace(",", ".")
+        return float(v) if v else None
+    except Exception:
+        return None
+ 
 def conectar_sheets():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -91,7 +82,6 @@ def conectar_sheets():
     client = gspread.authorize(creds)
     return client.open_by_key(SHEETS_ID).sheet1
  
-# ── Scraper ML ────────────────────────────────────────────────────────────────
 def extrair_item_id_ml(url: str) -> tuple:
     m = re.search(r'/p/(MLB\d+)', url, re.IGNORECASE)
     if m:
@@ -101,16 +91,13 @@ def extrair_item_id_ml(url: str) -> tuple:
         return ('item', m.group(1).upper().replace("-", ""))
     return (None, None)
  
- 
 def extrair_preco_ml(url: str) -> float | None:
     try:
         tipo, item_id = extrair_item_id_ml(url)
         if not item_id:
             log.warning("Item ID ML não encontrado: %s", url)
             return None
- 
         headers_ml = {"Authorization": f"Bearer {ML_ACCESS_TOKEN}"} if ML_ACCESS_TOKEN else {}
- 
         if tipo == 'catalog':
             resp = requests.get(
                 f"https://api.mercadolibre.com/products/{item_id}/items",
@@ -121,9 +108,8 @@ def extrair_preco_ml(url: str) -> float | None:
                 precos = [float(r["price"]) for r in resultados if r.get("price")]
                 if precos:
                     preco = min(precos)
-                    log.info("API ML catálogo (menor preço Pix): %s → R$ %.2f", item_id, preco)
+                    log.info("API ML catálogo: %s → R$ %.2f", item_id, preco)
                     return preco
- 
         resp = requests.get(
             f"https://api.mercadolibre.com/items/{item_id}",
             headers=headers_ml, timeout=15
@@ -132,16 +118,13 @@ def extrair_preco_ml(url: str) -> float | None:
             data = resp.json()
             preco = data.get("price")
             if preco:
-                log.info("API ML item: %s → R$ %.2f", item_id, float(preco))
                 return float(preco)
- 
         log.warning("Preço ML não encontrado: %s", item_id)
         return None
     except Exception as e:
         log.error("Erro ML (%s): %s", url, e)
         return None
  
-# ── Scraper Fornecedor ────────────────────────────────────────────────────────
 def fetch_url(url: str):
     try:
         if SCRAPER_API_KEY:
@@ -160,30 +143,25 @@ def fetch_url(url: str):
         log.error("Erro ao buscar URL (%s): %s", url, e)
         return None
  
- 
 def extrair_preco_fornecedor(url: str) -> float | None:
     from bs4 import BeautifulSoup
     try:
         resp = fetch_url(url)
         if not resp:
             return None
- 
         soup = BeautifulSoup(resp.text, "lxml")
- 
         for meta_name in ["product:price:amount", "og:price:amount"]:
             tag = soup.find("meta", property=meta_name)
             if tag and tag.get("content"):
                 v = re.sub(r"[^\d.]", "", tag["content"].replace(",", "."))
                 if v:
                     return float(v)
- 
         tag = soup.find(attrs={"itemprop": "price"})
         if tag:
             valor = tag.get("content") or tag.get_text(strip=True)
             valor = re.sub(r"[^\d.,]", "", valor).replace(".", "").replace(",", ".")
             if valor:
                 return float(valor)
- 
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(tag.string)
@@ -197,14 +175,12 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                         return float(price)
             except Exception:
                 pass
- 
         if "amazon" in url:
             el = soup.select_one("span.a-price-whole")
             if el:
                 v = re.sub(r"[^\d]", "", el.get_text())
                 if v:
                     return float(v)
- 
         for sel in ["[class*='price'] [class*='value']", "[class*='preco']", "[class*='price']"]:
             el = soup.select_one(sel)
             if el:
@@ -214,14 +190,12 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                         return float(nums[0].replace(".", "").replace(",", "."))
                     except Exception:
                         pass
- 
         log.warning("Preço fornecedor não encontrado: %s", url)
         return None
     except Exception as e:
         log.error("Erro fornecedor (%s): %s", url, e)
         return None
  
-# ── Telegram ──────────────────────────────────────────────────────────────────
 def telegram_send(mensagem: str) -> None:
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "SEU_TOKEN_AQUI":
         log.warning("Telegram não configurado.")
@@ -235,7 +209,6 @@ def telegram_send(mensagem: str) -> None:
     except Exception as e:
         log.error("Erro Telegram: %s", e)
  
-# ── Main ──────────────────────────────────────────────────────────────────────
 def processar() -> None:
     try:
         ws = conectar_sheets()
@@ -259,9 +232,9 @@ def processar() -> None:
         if not sku or not link_ml or not link_forn:
             continue
  
-        # Fórmula PMC personalizada (col G) — já calculada pelo Sheets
-        formula_val = row[COL_FORMULA].strip() if len(row) > COL_FORMULA else ""
-        status_ant  = row[COL_STATUS].strip() if len(row) > COL_STATUS else ""
+        # PMC da coluna F (fórmula do usuário, já calculada pelo Sheets)
+        pmc_planilha = parse_valor(row[COL_PMC]) if len(row) > COL_PMC else None
+        status_ant   = row[COL_STATUS].strip() if len(row) > COL_STATUS else ""
  
         log.info("Processando SKU %s ...", sku)
  
@@ -271,13 +244,18 @@ def processar() -> None:
         time.sleep(1.5)
  
         if preco_ml is None or preco_forn is None:
-            ws.update(f"H{row_idx}:I{row_idx}", [["⚠️ Erro na leitura", agora]])
+            ws.update(f"G{row_idx}:H{row_idx}", [["⚠️ Erro na leitura", agora]])
             continue
  
-        # PMC: usa valor da coluna G se disponível, senão fórmula padrão
-        pmc = calcular_pmc(preco_ml, formula_val)
-        origem_pmc = "fórmula planilha" if formula_val else "fórmula padrão"
-        log.info("PMC calculado (%s): R$ %.2f", origem_pmc, pmc)
+        # Atualiza D e E com números puros (para fórmulas do Sheets funcionarem)
+        ws.update(f"D{row_idx}:E{row_idx}", [[round(preco_ml, 2), round(preco_forn, 2)]])
+        time.sleep(0.5)
+ 
+        # Relê F após atualizar D (Sheets recalcula a fórmula)
+        pmc_atualizado = parse_valor(ws.cell(row_idx, COL_PMC + 1).value)
+        pmc = pmc_atualizado if pmc_atualizado else pmc_padrao(preco_ml)
+        origem = "planilha" if pmc_atualizado else "padrão"
+        log.info("PMC (%s): R$ %.2f", origem, pmc)
  
         if preco_forn > pmc:
             status = "🚨 ACIMA DO PMC"
@@ -302,14 +280,7 @@ def processar() -> None:
                     f"Data: {agora}"
                 )
  
-        # Atualiza D, E, F (não toca em G = fórmula do usuário)
-        ws.update(f"D{row_idx}:F{row_idx}", [[
-            f"R$ {preco_ml:.2f}",
-            f"R$ {preco_forn:.2f}",
-            f"R$ {pmc:.2f}",
-        ]])
-        # Atualiza H e I
-        ws.update(f"H{row_idx}:I{row_idx}", [[status, agora]])
+        ws.update(f"G{row_idx}:H{row_idx}", [[status, agora]])
  
         log.info("  ML=R$%.2f  Forn=R$%.2f  PMC=R$%.2f  → %s",
                  preco_ml, preco_forn, pmc, status)
@@ -323,6 +294,12 @@ def processar() -> None:
  
     if not alertas:
         log.info("Nenhuma mudança de status detectada.")
+ 
+ 
+if __name__ == "__main__":
+    log.info("=== Container iniciado — aguardando agendamento do Dokploy ===")
+    while True:
+        time.sleep(60)
  
  
 if __name__ == "__main__":
