@@ -4,7 +4,7 @@ monitor_precos.py
 Colunas da planilha:
   A=SKU, B=Link ML, C=Link Fornecedor, D=Preço ML (número),
   E=Preço Fornecedor (número), F=PMC Máximo (fórmula do usuário),
-  G=Status, H=Última Atualização, I=Descontos, J=Melhor Preço Unit.
+  G=Descontos, H=Melhor Preço Unit., I=Status, J=Última Atualização
 """
 
 import re
@@ -53,10 +53,10 @@ COL_LINK_FORN  = 2   # C
 COL_PRECO_ML   = 3   # D
 COL_PRECO_FORN = 4   # E  — P&P quando disponível, senão preço normal
 COL_PMC        = 5   # F
-COL_STATUS     = 6   # G
-COL_ATUALIZADO = 7   # H
-COL_DESCONTOS  = 8   # I
-COL_MELHOR_UN  = 9   # J
+COL_DESCONTOS  = 6   # G
+COL_MELHOR_UN  = 7   # H
+COL_STATUS     = 8   # I
+COL_ATUALIZADO = 9   # J
 
 # ---------------------------------------------------------------------------
 # Credenciais e renovação de token ML
@@ -395,8 +395,6 @@ def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
     texto_pagina = soup.get_text(" ")
 
     if is_amazon:
-        # DEBUG: loga trecho relevante da página para diagnóstico
-        _debug_trecho_descontos(texto_pagina)
 
         # 1. Cupons resgatáveis (botão Resgatar)
         blocos = _coletar_blocos_cupom_amazon(soup)
@@ -440,18 +438,6 @@ def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
     return descontos, texto_i
 
 
-def _debug_trecho_descontos(texto_pagina: str) -> None:
-    """Loga trechos ao redor de cada palavra-chave de desconto."""
-    encontrou = False
-    for palavra in ["cupom", "Economize", "BOLANAREDE", "Resgatar"]:
-        idx = texto_pagina.lower().find(palavra.lower())
-        if idx >= 0:
-            trecho = texto_pagina[max(0, idx-30):idx+200]
-            trecho = " ".join(trecho.split())
-            log.info("DEBUG [%s]: ...%s...", palavra, trecho)
-            encontrou = True
-    if not encontrou:
-        log.info("DEBUG: nenhuma palavra-chave de desconto encontrada na página.")
 
 
 def _coletar_blocos_cupom_amazon(soup) -> list[str]:
@@ -696,11 +682,11 @@ def processar() -> None:
 
         # Grava I e J sempre que tiver dados do fornecedor
         if texto_i or texto_j:
-            ws.update(f"I{row_idx}:J{row_idx}", [[texto_i, texto_j]])
+            ws.update(f"G{row_idx}:H{row_idx}", [[texto_i, texto_j]])
             time.sleep(0.3)
 
         if preco_ml is None or preco_forn is None:
-            ws.update(f"G{row_idx}:H{row_idx}", [["⚠️ Erro na leitura", agora]])
+            ws.update(f"I{row_idx}:J{row_idx}", [["⚠️ Erro na leitura", agora]])
             continue
 
         ws.update(f"D{row_idx}:E{row_idx}", [[round(preco_ml, 2), round(preco_forn, 2)]])
@@ -738,7 +724,7 @@ def processar() -> None:
                     f"Data: {agora}"
                 )
 
-        ws.update(f"G{row_idx}:H{row_idx}", [[status, agora]])
+        ws.update(f"I{row_idx}:J{row_idx}", [[status, agora]])
         log.info(
             " ML=R$%.2f Forn=R$%.2f PMC=R$%.2f → %s | I=%s | J=%s",
             preco_ml, preco_forn, pmc, status,
