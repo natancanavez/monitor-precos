@@ -6,6 +6,10 @@ monitor_precos.py
 4. Calcula PMC via fórmula da planilha (col G) ou padrão
 5. Atualiza colunas no Google Sheets
 6. Envia alertas via Telegram quando necessário
+ 
+Colunas da planilha:
+A=SKU, B=Link ML, C=Link Fornecedor, D=Preço ML, E=Preço Forn,
+F=PMC Calculado, G=Fórmula PMC (usuário), H=Status, I=Última Atualização
 """
  
 import re
@@ -24,7 +28,7 @@ from config import (
     COMISSAO_ML, IMPOSTO_DAS, MARGEM_MIN, FRETE_FIXO,
 )
  
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -49,32 +53,30 @@ ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 SHEETS_ID       = os.environ.get("SHEETS_ID", "")
  
-# ── Colunas ───────────────────────────────────────────────────────────────────
+# ── Índices das colunas (0-based) ─────────────────────────────────────────────
 COL_SKU        = 0   # A
 COL_LINK_ML    = 1   # B
 COL_LINK_FORN  = 2   # C
 COL_PRECO_ML   = 3   # D
 COL_PRECO_FORN = 4   # E
 COL_PMC        = 5   # F
-COL_FORMULA    = 6   # G ← fórmula personalizada
+COL_FORMULA    = 6   # G ← fórmula personalizada do usuário
 COL_STATUS     = 7   # H
 COL_ATUALIZADO = 8   # I
  
-# ── Fórmula PMC ──────────────────────────────────────────────────────────────
+# ── Fórmula PMC ───────────────────────────────────────────────────────────────
 def calcular_pmc(preco_ml: float, formula_valor: str = "") -> float:
     """
     Se formula_valor for um número válido (calculado pelo Sheets), usa ele.
-    Senão, usa a fórmula padrão.
+    Senão, usa a fórmula padrão: Preço ML × (1 - desconto) - frete.
     """
     if formula_valor:
         try:
-            # Remove R$, espaços e converte vírgula para ponto
-            v = re.sub(r"[^\d.,]", "", str(formula_valor)).replace(",", ".")
+            v = re.sub(r"[^\d.,]", "", str(formula_valor)).replace(".", "").replace(",", ".")
             if v:
                 return round(float(v), 2)
         except Exception:
             pass
-    # Fórmula padrão
     return round(preco_ml * (1 - DESCONTO) - FRETE_FIXO, 2)
  
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -88,13 +90,6 @@ def conectar_sheets():
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEETS_ID).sheet1
- 
- 
-def garantir_cabecalhos(ws) -> None:
-    # Apenas loga os cabeçalhos, não sobrescreve
-    headers = ws.row_values(1)
-    log.info("Cabeçalhos encontrados: %s", headers)
- 
  
 # ── Scraper ML ────────────────────────────────────────────────────────────────
 def extrair_item_id_ml(url: str) -> tuple:
@@ -145,7 +140,6 @@ def extrair_preco_ml(url: str) -> float | None:
     except Exception as e:
         log.error("Erro ML (%s): %s", url, e)
         return None
- 
  
 # ── Scraper Fornecedor ────────────────────────────────────────────────────────
 def fetch_url(url: str):
@@ -227,8 +221,7 @@ def extrair_preco_fornecedor(url: str) -> float | None:
         log.error("Erro fornecedor (%s): %s", url, e)
         return None
  
- 
-# ── Telegram ─────────────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 def telegram_send(mensagem: str) -> None:
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "SEU_TOKEN_AQUI":
         log.warning("Telegram não configurado.")
@@ -242,7 +235,6 @@ def telegram_send(mensagem: str) -> None:
     except Exception as e:
         log.error("Erro Telegram: %s", e)
  
- 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def processar() -> None:
     try:
@@ -252,9 +244,6 @@ def processar() -> None:
         log.error("Erro ao conectar Google Sheets: %s", e)
         return
  
-    garantir_cabecalhos(ws)
- 
-    # Busca todos os valores (fórmulas já calculadas pelo Sheets)
     todos_dados = ws.get_all_values()
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
     alertas = []
@@ -287,6 +276,8 @@ def processar() -> None:
  
         # PMC: usa valor da coluna G se disponível, senão fórmula padrão
         pmc = calcular_pmc(preco_ml, formula_val)
+        origem_pmc = "fórmula planilha" if formula_val else "fórmula padrão"
+        log.info("PMC calculado (%s): R$ %.2f", origem_pmc, pmc)
  
         if preco_forn > pmc:
             status = "🚨 ACIMA DO PMC"
@@ -311,12 +302,13 @@ def processar() -> None:
                     f"Data: {agora}"
                 )
  
-        # Atualiza D, E, F, H, I (não toca em G que é a fórmula do usuário)
+        # Atualiza D, E, F (não toca em G = fórmula do usuário)
         ws.update(f"D{row_idx}:F{row_idx}", [[
             f"R$ {preco_ml:.2f}",
             f"R$ {preco_forn:.2f}",
             f"R$ {pmc:.2f}",
         ]])
+        # Atualiza H e I
         ws.update(f"H{row_idx}:I{row_idx}", [[status, agora]])
  
         log.info("  ML=R$%.2f  Forn=R$%.2f  PMC=R$%.2f  → %s",
