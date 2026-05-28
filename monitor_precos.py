@@ -1,9 +1,10 @@
 """
 monitor_precos.py
-Colunas da planilha:
-A=SKU, B=Link ML, C=Link Fornecedor, D=Preço ML (número),
-E=Preço Fornecedor (número), F=PMC Máximo (fórmula do usuário),
-G=Status, H=Última Atualização
+1. Lê produtos do Google Sheets
+2. Raspa preços do ML via API oficial (vencedor do catálogo)
+3. Raspa preços do fornecedor via ScraperAPI
+4. Atualiza colunas 4-6 no Google Sheets
+5. Envia alertas via Telegram quando necessário
 """
 
 import re
@@ -22,6 +23,7 @@ from config import (
     COMISSAO_ML, IMPOSTO_DAS, MARGEM_MIN, FRETE_FIXO,
 )
 
+# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -46,31 +48,11 @@ ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 SHEETS_ID       = os.environ.get("SHEETS_ID", "")
 
-COL_SKU        = 0   # A
-COL_LINK_ML    = 1   # B
-COL_LINK_FORN  = 2   # C
-COL_PRECO_ML   = 3   # D — número puro, usado nas fórmulas do Sheets
-COL_PRECO_FORN = 4   # E — número puro
-COL_PMC        = 5   # F — fórmula do usuário (ex: =D2*0.72-20)
-COL_STATUS     = 6   # G
-COL_ATUALIZADO = 7   # H
-
-def pmc_padrao(preco_ml: float) -> float:
+# ── Fórmula PMC ──────────────────────────────────────────────────────────────
+def calcular_pmc(preco_ml: float) -> float:
     return round(preco_ml * (1 - DESCONTO) - FRETE_FIXO, 2)
 
-def parse_valor(s: str) -> float | None:
-    """Converte string de valor (ex: '71.17', 'R$ 71,17') para float."""
-    try:
-        v = re.sub(r"[^\d.,]", "", str(s))
-        # Se tiver vírgula e ponto, formato brasileiro: 1.234,56
-        if "," in v and "." in v:
-            v = v.replace(".", "").replace(",", ".")
-        elif "," in v:
-            v = v.replace(",", ".")
-        return float(v) if v else None
-    except Exception:
-        return None
-
+# ── Google Sheets ─────────────────────────────────────────────────────────────
 def conectar_sheets():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -82,6 +64,20 @@ def conectar_sheets():
     client = gspread.authorize(creds)
     return client.open_by_key(SHEETS_ID).sheet1
 
+
+def garantir_cabecalhos(ws) -> None:
+    headers = ws.row_values(1)
+    esperados = [
+        "SKU", "Link ML", "Link Fornecedor",
+        "Preço ML (R$)", "Preço Fornecedor (R$)",
+        "PMC Máximo (R$)", "Status", "Última Atualização",
+    ]
+    if headers != esperados:
+        ws.update("A1:H1", [esperados])
+        log.info("Cabeçalhos criados na planilha.")
+
+
+# ── Scraper ML ────────────────────────────────────────────────────────────────
 def extrair_item_id_ml(url: str) -> tuple:
     m = re.search(r'/p/(MLB\d+)', url, re.IGNORECASE)
     if m:
@@ -91,25 +87,55 @@ def extrair_item_id_ml(url: str) -> tuple:
         return ('item', m.group(1).upper().replace("-", ""))
     return (None, None)
 
+
 def extrair_preco_ml(url: str) -> float | None:
     try:
         tipo, item_id = extrair_item_id_ml(url)
         if not item_id:
             log.warning("Item ID ML não encontrado: %s", url)
             return None
+
         headers_ml = {"Authorization": f"Bearer {ML_ACCESS_TOKEN}"} if ML_ACCESS_TOKEN else {}
+
         if tipo == 'catalog':
+            # 1. Busca o produto para encontrar o vencedor do catálogo (buy box)
             resp = requests.get(
-                f"https://api.mercadolibre.com/products/{item_id}/items",
+                f"https://api.mercadolibre.com/products/{item_id}",
+                headers=headers_ml, timeout=15
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                winner_item_id = data.get("buy_box_winner", {}).get("item_id")
+
+                if winner_item_id:
+                    # 2. Busca o preço do item vencedor diretamente
+                    resp_item = requests.get(
+                        f"https://api.mercadolibre.com/items/{winner_item_id}",
+                        headers=headers_ml, timeout=15
+                    )
+                    if resp_item.status_code == 200:
+                        preco = resp_item.json().get("price")
+                        if preco:
+                            log.info("API ML catálogo winner (%s → %s): R$ %.2f",
+                                     item_id, winner_item_id, float(preco))
+                            return float(preco)
+                else:
+                    log.warning("buy_box_winner não encontrado para %s, usando fallback.", item_id)
+
+            # Fallback: lista de items ativos, pega o primeiro (geralmente o winner)
+            resp = requests.get(
+                f"https://api.mercadolibre.com/products/{item_id}/items?status=active",
                 headers=headers_ml, timeout=15
             )
             if resp.status_code == 200:
                 resultados = resp.json().get("results", [])
-                precos = [float(r["price"]) for r in resultados if r.get("price")]
-                if precos:
-                    preco = min(precos)
-                    log.info("API ML catálogo: %s → R$ %.2f", item_id, preco)
+                if resultados:
+                    preco = float(resultados[0]["price"])
+                    log.info("API ML catálogo fallback (1º item ativo): %s → R$ %.2f",
+                             item_id, preco)
                     return preco
+
+        # Item direto (não catálogo)
         resp = requests.get(
             f"https://api.mercadolibre.com/items/{item_id}",
             headers=headers_ml, timeout=15
@@ -118,13 +144,17 @@ def extrair_preco_ml(url: str) -> float | None:
             data = resp.json()
             preco = data.get("price")
             if preco:
+                log.info("API ML item: %s → R$ %.2f", item_id, float(preco))
                 return float(preco)
+
         log.warning("Preço ML não encontrado: %s", item_id)
         return None
     except Exception as e:
         log.error("Erro ML (%s): %s", url, e)
         return None
 
+
+# ── Scraper Fornecedor ────────────────────────────────────────────────────────
 def fetch_url(url: str):
     try:
         if SCRAPER_API_KEY:
@@ -143,25 +173,30 @@ def fetch_url(url: str):
         log.error("Erro ao buscar URL (%s): %s", url, e)
         return None
 
+
 def extrair_preco_fornecedor(url: str) -> float | None:
     from bs4 import BeautifulSoup
     try:
         resp = fetch_url(url)
         if not resp:
             return None
+
         soup = BeautifulSoup(resp.text, "lxml")
+
         for meta_name in ["product:price:amount", "og:price:amount"]:
             tag = soup.find("meta", property=meta_name)
             if tag and tag.get("content"):
                 v = re.sub(r"[^\d.]", "", tag["content"].replace(",", "."))
                 if v:
                     return float(v)
+
         tag = soup.find(attrs={"itemprop": "price"})
         if tag:
             valor = tag.get("content") or tag.get_text(strip=True)
             valor = re.sub(r"[^\d.,]", "", valor).replace(".", "").replace(",", ".")
             if valor:
                 return float(valor)
+
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(tag.string)
@@ -175,50 +210,14 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                         return float(price)
             except Exception:
                 pass
-        if "amazon" in url:
-            # Tenta Programe e Poupe — múltiplos seletores em ordem de prioridade
-            sns_seletores = [
-                "#sns-tiered-price",
-                "#sns-base-price",
-                "#subscriptionPrice",
-                "#snsAccordionRowMiddle",
-            ]
-            for sel in sns_seletores:
-                el = soup.select_one(sel)
-                if el:
-                    texto = el.get_text(strip=True)
-                    nums = re.findall(r"[\d]+[.,][\d]{2}", texto)
-                    if nums:
-                        try:
-                            v = nums[0].replace(".", "").replace(",", ".")
-                            preco = float(v)
-                            if preco > 0:
-                                log.info("Amazon Programe e Poupe (%s): R$ %.2f", sel, preco)
-                                return preco
-                        except Exception:
-                            pass
 
-            # Fallback: preço normal
-            for sel in [
-                "#apex-pricetopay-accessibility-label",
-                "#priceblock_ourprice",
-                "#priceblock_dealprice",
-                ".a-price .a-offscreen",
-                "span.a-price-whole",
-            ]:
-                el = soup.select_one(sel)
-                if el:
-                    texto = el.get("content") or el.get_text(strip=True)
-                    nums = re.findall(r"[\d]+[.,][\d]{2}", texto)
-                    if nums:
-                        try:
-                            v = nums[0].replace(".", "").replace(",", ".")
-                            preco = float(v)
-                            if preco > 0:
-                                log.info("Amazon preço normal (%s): R$ %.2f", sel, preco)
-                                return preco
-                        except Exception:
-                            pass
+        if "amazon" in url:
+            el = soup.select_one("span.a-price-whole")
+            if el:
+                v = re.sub(r"[^\d]", "", el.get_text())
+                if v:
+                    return float(v)
+
         for sel in ["[class*='price'] [class*='value']", "[class*='preco']", "[class*='price']"]:
             el = soup.select_one(sel)
             if el:
@@ -228,12 +227,15 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                         return float(nums[0].replace(".", "").replace(",", "."))
                     except Exception:
                         pass
+
         log.warning("Preço fornecedor não encontrado: %s", url)
         return None
     except Exception as e:
         log.error("Erro fornecedor (%s): %s", url, e)
         return None
 
+
+# ── Telegram ─────────────────────────────────────────────────────────────────
 def telegram_send(mensagem: str) -> None:
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "SEU_TOKEN_AQUI":
         log.warning("Telegram não configurado.")
@@ -247,6 +249,8 @@ def telegram_send(mensagem: str) -> None:
     except Exception as e:
         log.error("Erro Telegram: %s", e)
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def processar() -> None:
     try:
         ws = conectar_sheets()
@@ -254,6 +258,8 @@ def processar() -> None:
     except Exception as e:
         log.error("Erro ao conectar Google Sheets: %s", e)
         return
+
+    garantir_cabecalhos(ws)
 
     todos_dados = ws.get_all_values()
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -263,16 +269,15 @@ def processar() -> None:
         if len(row) < 3:
             continue
 
-        sku       = row[COL_SKU].strip()
-        link_ml   = row[COL_LINK_ML].strip()
-        link_forn = row[COL_LINK_FORN].strip()
+        sku       = row[0].strip()
+        link_ml   = row[1].strip()
+        link_forn = row[2].strip()
 
         if not sku or not link_ml or not link_forn:
             continue
 
-        # PMC da coluna F (fórmula do usuário, já calculada pelo Sheets)
-        pmc_planilha = parse_valor(row[COL_PMC]) if len(row) > COL_PMC else None
-        status_ant   = row[COL_STATUS].strip() if len(row) > COL_STATUS else ""
+        # Status anterior
+        status_ant = row[6].strip() if len(row) > 6 else ""
 
         log.info("Processando SKU %s ...", sku)
 
@@ -285,15 +290,7 @@ def processar() -> None:
             ws.update(f"G{row_idx}:H{row_idx}", [["⚠️ Erro na leitura", agora]])
             continue
 
-        # Atualiza D e E com números puros (para fórmulas do Sheets funcionarem)
-        ws.update(f"D{row_idx}:E{row_idx}", [[round(preco_ml, 2), round(preco_forn, 2)]])
-        time.sleep(0.5)
-
-        # Relê F após atualizar D (Sheets recalcula a fórmula)
-        pmc_atualizado = parse_valor(ws.cell(row_idx, COL_PMC + 1).value)
-        pmc = pmc_atualizado if pmc_atualizado else pmc_padrao(preco_ml)
-        origem = "planilha" if pmc_atualizado else "padrão"
-        log.info("PMC (%s): R$ %.2f", origem, pmc)
+        pmc = calcular_pmc(preco_ml)
 
         if preco_forn > pmc:
             status = "🚨 ACIMA DO PMC"
@@ -318,12 +315,18 @@ def processar() -> None:
                     f"Data: {agora}"
                 )
 
-        ws.update(f"G{row_idx}:H{row_idx}", [[status, agora]])
+        ws.update(f"D{row_idx}:H{row_idx}", [[
+            f"R$ {preco_ml:.2f}",
+            f"R$ {preco_forn:.2f}",
+            f"R$ {pmc:.2f}",
+            status,
+            agora,
+        ]])
 
         log.info("  ML=R$%.2f  Forn=R$%.2f  PMC=R$%.2f  → %s",
                  preco_ml, preco_forn, pmc, status)
 
-        time.sleep(1)
+        time.sleep(1)  # Evita rate limit do Sheets
 
     log.info("Planilha atualizada no Google Sheets ✅")
 
