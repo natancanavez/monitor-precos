@@ -259,6 +259,34 @@ def extrair_preco_fornecedor(url: str) -> float | None:
             except Exception:
                 pass
 
+        if "drogasil" in url or "drogaraia" in url:
+            # Tenta Leve + Pague primeiro
+            el = soup.select_one("#pdp-floating-price-container")
+            if el:
+                nums = re.findall(r"[\d]+[.,][\d]{2}", el.get_text(strip=True))
+                if nums:
+                    try:
+                        v = nums[0].replace(".", "").replace(",", ".")
+                        preco = float(v)
+                        if preco > 0:
+                            log.info("Drogasil Leve+Pague: R$ %.2f", preco)
+                            return preco
+                    except Exception:
+                        pass
+            # Fallback: preço normal
+            el = soup.select_one("#pdp-price-container, .product-price")
+            if el:
+                nums = re.findall(r"[\d]+[.,][\d]{2}", el.get_text(strip=True))
+                if nums:
+                    try:
+                        v = nums[0].replace(".", "").replace(",", ".")
+                        preco = float(v)
+                        if preco > 0:
+                            log.info("Drogasil preço normal: R$ %.2f", preco)
+                            return preco
+                    except Exception:
+                        pass
+
         if "amazon" in url:
             sns_seletores = ["#sns-tiered-price", "#sns-base-price", "#subscriptionPrice", "#snsAccordionRowMiddle"]
             for sel in sns_seletores:
