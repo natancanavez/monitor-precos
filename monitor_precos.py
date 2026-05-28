@@ -4,7 +4,7 @@ monitor_precos.py
 Colunas da planilha:
   A=SKU, B=Link ML, C=Link Fornecedor, D=Preço ML (número),
   E=Preço Fornecedor (número), F=PMC Máximo (fórmula do usuário),
-  G=Status, H=Última Atualização, I=Descontos Amazon, J=Melhor Preço Unit.
+  G=Status, H=Última Atualização, I=Descontos, J=Melhor Preço Unit.
 """
 
 import re
@@ -13,7 +13,7 @@ import time
 import logging
 import requests
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
@@ -51,7 +51,7 @@ COL_SKU        = 0   # A
 COL_LINK_ML    = 1   # B
 COL_LINK_FORN  = 2   # C
 COL_PRECO_ML   = 3   # D
-COL_PRECO_FORN = 4   # E
+COL_PRECO_FORN = 4   # E  — P&P quando disponível, senão preço normal
 COL_PMC        = 5   # F
 COL_STATUS     = 6   # G
 COL_ATUALIZADO = 7   # H
@@ -65,12 +65,12 @@ COL_MELHOR_UN  = 9   # J
 
 @dataclass
 class Desconto:
-    tipo: str            # 'cupom_pct', 'cupom_fixo', 'mpm', 'pp'
-    codigo: str = ""     # código do cupom (vazio para mpm/pp)
-    pct: float = 0.0     # ex: 0.10 para 10%
-    fixo: float = 0.0    # ex: 50.0 para -R$50
-    min_valor: float = 0.0   # pedido mínimo em R$ para o cupom ser válido
-    min_qtd: int = 1         # qtd mínima (MpM)
+    tipo: str            # 'cupom_pct', 'cupom_fixo', 'mpm'
+    codigo: str = ""
+    pct: float = 0.0     # fração: 0.10 para 10%
+    fixo: float = 0.0    # valor fixo: 50.0 para -R$50
+    min_valor: float = 0.0
+    min_qtd: int = 1
     prime: bool = False
 
 
@@ -187,25 +187,59 @@ def fetch_url(url: str):
 
 
 # ---------------------------------------------------------------------------
-# Extração de preço do fornecedor (lógica original, sem alteração)
+# Extração de preço do fornecedor
+# Retorna (preco_coluna_e, preco_base_calc_j)
+#   preco_coluna_e  = P&P se disponível, senão preço normal  → coluna E
+#   preco_base_calc_j = preço original sem P&P               → base para coluna J
 # ---------------------------------------------------------------------------
 
-def extrair_preco_fornecedor_soup(soup, url: str) -> float | None:
-    """Extrai preço do soup. Prioriza Programe e Poupe na Amazon."""
+def extrair_preco_fornecedor_soup(soup, url: str) -> tuple[float | None, float | None]:
+    """
+    Retorna (preco_coluna_e, preco_base_j).
+
+    Para Amazon:
+      - preco_coluna_e  = Programe e Poupe (se disponível) ou preço normal
+      - preco_base_j    = preço original (compra única, sem P&P)
+        A Amazon aplica MpM e cupons sobre o preço original, então a base
+        do cálculo da coluna J precisa ser esse valor.
+
+    Para outros fornecedores:
+      - ambos são iguais (sem distinção P&P/original)
+    """
+    if "amazon" not in url:
+        p = _extrair_preco_generico(soup)
+        if p:
+            log.info("Preço fornecedor: R$ %.2f", p)
+        else:
+            log.warning("Preço fornecedor não encontrado: %s", url)
+        return p, p
+
+    # Amazon — captura preço original e P&P separadamente
+    preco_original = _extrair_preco_original_amazon(soup)
+    preco_pp       = _extrair_preco_pp_amazon(soup)
+
+    preco_coluna_e = preco_pp if preco_pp else preco_original
+    preco_base_j   = preco_original if preco_original else preco_coluna_e
+
+    if preco_coluna_e is None:
+        log.warning("Preço Amazon não encontrado: %s", url)
+
+    return preco_coluna_e, preco_base_j
+
+
+def _extrair_preco_generico(soup) -> float | None:
     for meta_name in ["product:price:amount", "og:price:amount"]:
         tag = soup.find("meta", property=meta_name)
         if tag and tag.get("content"):
             v = re.sub(r"[^\d.]", "", tag["content"].replace(",", "."))
             if v:
                 return float(v)
-
     tag = soup.find(attrs={"itemprop": "price"})
     if tag:
         valor = tag.get("content") or tag.get_text(strip=True)
         valor = re.sub(r"[^\d.,]", "", valor).replace(".", "").replace(",", ".")
         if valor:
             return float(valor)
-
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(tag.string)
@@ -219,44 +253,6 @@ def extrair_preco_fornecedor_soup(soup, url: str) -> float | None:
                     return float(price)
         except Exception:
             pass
-
-    if "amazon" in url:
-        # Programe e Poupe — prioridade
-        for sel in ["#sns-tiered-price", "#sns-base-price",
-                    "#subscriptionPrice", "#snsAccordionRowMiddle"]:
-            el = soup.select_one(sel)
-            if el:
-                nums = re.findall(r"[\d]+[.,][\d]{2}", el.get_text(strip=True))
-                if nums:
-                    try:
-                        preco = float(nums[0].replace(".", "").replace(",", "."))
-                        if preco > 0:
-                            log.info("Amazon P&P (%s): R$ %.2f", sel, preco)
-                            return preco
-                    except Exception:
-                        pass
-
-        # Fallback: preço normal
-        for sel in [
-            "#apex-pricetopay-accessibility-label",
-            "#priceblock_ourprice",
-            "#priceblock_dealprice",
-            ".a-price .a-offscreen",
-            "span.a-price-whole",
-        ]:
-            el = soup.select_one(sel)
-            if el:
-                texto = el.get("content") or el.get_text(strip=True)
-                nums = re.findall(r"[\d]+[.,][\d]{2}", texto)
-                if nums:
-                    try:
-                        preco = float(nums[0].replace(".", "").replace(",", "."))
-                        if preco > 0:
-                            log.info("Amazon preço normal (%s): R$ %.2f", sel, preco)
-                            return preco
-                    except Exception:
-                        pass
-
     for sel in ["[class*='price'] [class*='value']", "[class*='preco']", "[class*='price']"]:
         el = soup.select_one(sel)
         if el:
@@ -266,21 +262,60 @@ def extrair_preco_fornecedor_soup(soup, url: str) -> float | None:
                     return float(nums[0].replace(".", "").replace(",", "."))
                 except Exception:
                     pass
+    return None
 
-    log.warning("Preço fornecedor não encontrado: %s", url)
+
+def _extrair_preco_original_amazon(soup) -> float | None:
+    """Preço de compra única (sem Programe e Poupe)."""
+    for sel in [
+        "#apex-pricetopay-accessibility-label",
+        "#priceblock_ourprice",
+        "#priceblock_dealprice",
+        ".a-price .a-offscreen",
+        "span.a-price-whole",
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            texto = el.get("content") or el.get_text(strip=True)
+            nums = re.findall(r"[\d]+[.,][\d]{2}", texto)
+            if nums:
+                try:
+                    p = float(nums[0].replace(".", "").replace(",", "."))
+                    if p > 0:
+                        log.info("Amazon preço original (%s): R$ %.2f", sel, p)
+                        return p
+                except Exception:
+                    pass
+    return None
+
+
+def _extrair_preco_pp_amazon(soup) -> float | None:
+    """Preço Programe e Poupe."""
+    for sel in ["#sns-tiered-price", "#sns-base-price",
+                "#subscriptionPrice", "#snsAccordionRowMiddle"]:
+        el = soup.select_one(sel)
+        if el:
+            nums = re.findall(r"[\d]+[.,][\d]{2}", el.get_text(strip=True))
+            if nums:
+                try:
+                    p = float(nums[0].replace(".", "").replace(",", "."))
+                    if p > 0:
+                        log.info("Amazon P&P (%s): R$ %.2f", sel, p)
+                        return p
+                except Exception:
+                    pass
     return None
 
 
 # ---------------------------------------------------------------------------
-# Extração de descontos → lista estruturada + texto para coluna I
-# Atualmente com seletores HTML para Amazon; expansível para outros fornecedores
+# Extração de descontos → lista estruturada + texto coluna I
+# Suporta Amazon hoje; expansível com blocos elif para outros fornecedores
 # ---------------------------------------------------------------------------
 
 def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
     """
-    Retorna (lista_de_descontos, texto_coluna_I).
-    Não inclui Programe e Poupe (preço já está na coluna E).
-    Hoje suporta Amazon; adicione blocos `if "outrofornecedor" in url` para expandir.
+    Retorna (lista_descontos, texto_coluna_I).
+    Não inclui Programe e Poupe (já refletido no preço da coluna E).
     """
     is_amazon = "amazon" in url
 
@@ -288,18 +323,17 @@ def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
     texto_pagina = soup.get_text(" ")
 
     if is_amazon:
-        # --- 1. Cupons resgatáveis (botão Resgatar) ---
-        # Tenta pegar pelo HTML estruturado primeiro
-        blocos_cupom = _coletar_blocos_cupom_amazon(soup)
+        # DEBUG: loga trecho relevante da página para diagnóstico
+        _debug_trecho_descontos(texto_pagina)
 
-        # Fallback: texto completo da página
-        if not blocos_cupom:
-            blocos_cupom = [texto_pagina]
-
-        for bloco in blocos_cupom:
+        # 1. Cupons resgatáveis (botão Resgatar)
+        blocos = _coletar_blocos_cupom_amazon(soup)
+        if not blocos:
+            blocos = [texto_pagina]
+        for bloco in blocos:
             descontos.extend(_parsear_cupons_do_bloco(bloco))
 
-        # --- 2. Mais por Menos ---
+        # 2. Mais por Menos
         mpm_re = re.compile(
             r'Mais\s+por\s+Menos[:\s]*\+?([\d]+)%\s*off\s*em\s*([\d]+)\+?\s*iten?s?',
             re.IGNORECASE,
@@ -311,13 +345,10 @@ def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
                 min_qtd=int(m.group(2)),
             ))
 
-    # Futuramente: elif "magazineluiza" in url: ...
-    # elif "shopee" in url: ...
+    # elif "outrofornecedor" in url: ...
 
-    # Remove duplicatas mantendo ordem
     descontos = _deduplicar(descontos)
 
-    # Monta texto da coluna I
     partes = []
     for d in descontos:
         if d.tipo == 'cupom_pct':
@@ -332,7 +363,21 @@ def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
     texto_i = " | ".join(partes)
     if texto_i:
         log.info("Descontos: %s", texto_i)
+    else:
+        log.info("Nenhum desconto encontrado na página.")
     return descontos, texto_i
+
+
+def _debug_trecho_descontos(texto_pagina: str) -> None:
+    """Loga os 300 chars ao redor das palavras-chave para diagnóstico."""
+    for palavra in ["Mais por Menos", "cupom", "Resgatar", "BOLANAREDE"]:
+        idx = texto_pagina.lower().find(palavra.lower())
+        if idx >= 0:
+            trecho = texto_pagina[max(0, idx-50):idx+250]
+            trecho = " ".join(trecho.split())
+            log.info("DEBUG desconto [%s]: ...%s...", palavra, trecho)
+            return
+    log.info("DEBUG: nenhuma palavra-chave de desconto encontrada na página.")
 
 
 def _coletar_blocos_cupom_amazon(soup) -> list[str]:
@@ -354,7 +399,7 @@ def _coletar_blocos_cupom_amazon(soup) -> list[str]:
 def _parsear_cupons_do_bloco(texto: str) -> list[Desconto]:
     resultado = []
 
-    # Padrão percentual: "10% de desconto em pedidos a partir de R$100 cupom: CODIGO"
+    # Percentual: "10% de desconto em pedidos a partir de R$100 cupom: CODIGO"
     for m in re.finditer(
         r'(\d+)%[^R$\d]*?(?:a partir de\s*)?R?\$?\s*([\d.,]+)[^:]*cupom\s*:\s*(\w+)',
         texto, re.IGNORECASE
@@ -368,7 +413,7 @@ def _parsear_cupons_do_bloco(texto: str) -> list[Desconto]:
             prime=prime,
         ))
 
-    # Padrão fixo: "Economize R$50 em pedidos R$299+ cupom: CODIGO"
+    # Fixo: "Economize R$50 em pedidos R$450+ cupom: CODIGO"
     for m in re.finditer(
         r'[Ee]conomize\s+R?\$?\s*([\d.,]+)[^R$\d]*R?\$?\s*([\d.,]+)\+?[^:]*cupom\s*:\s*(\w+)',
         texto, re.IGNORECASE
@@ -398,82 +443,69 @@ def _deduplicar(descontos: list[Desconto]) -> list[Desconto]:
 
 # ---------------------------------------------------------------------------
 # Cálculo do melhor preço unitário (coluna J)
+#
+# A Amazon aplica todos os descontos sobre o preco_original (compra única):
+#   total = preco_original × qtd × (1 - pct_mpm - pct_cupons) - fixos_cupons
+#
+# O preco_base passado aqui é o preco_original (não o P&P), garantindo
+# que o resultado bata com o que o checkout da Amazon mostra.
 # ---------------------------------------------------------------------------
 
 def calcular_melhor_preco_unitario(
-    preco_base: float,
+    preco_original: float,
     descontos: list[Desconto],
 ) -> tuple[float, int]:
     """
-    Dado o preço base (coluna E) e a lista de descontos, calcula o menor
-    custo unitário possível aplicando todos os descontos cabíveis.
-
     Retorna (preco_unitario, quantidade_necessaria).
 
-    Lógica de aplicação (ordem do checkout Amazon):
-      1. Subtotal = qtd × preco_base
-      2. MpM: aplica o maior % de desconto para a quantidade
-      3. Cupom % : aplica se subtotal_pos_mpm >= min_valor
-      4. Cupom fixo: subtrai se subtotal_pos_mpm >= min_valor
-      (cupons % e fixo se acumulam se houver mais de um)
+    Ordem de aplicação (espelha o checkout da Amazon):
+      1. MpM  → % sobre subtotal original
+      2. Cupom % → % sobre subtotal original (acumulativo)
+      3. Cupom fixo → subtrai diretamente
     """
-    # Tiers MpM: [(min_qtd, pct), ...] ordenados
     tiers_mpm = sorted(
         [(d.min_qtd, d.pct) for d in descontos if d.tipo == 'mpm'],
         key=lambda x: x[0]
     )
 
-    # Quantidades a testar:
-    #   - 1 unidade (sem MpM)
-    #   - cada tier de MpM
-    #   - quantidade mínima para atingir o min_valor de cada cupom
     qtds_testar = {1}
     for qtd, _ in tiers_mpm:
         qtds_testar.add(qtd)
-
-    # Para cupons com min_valor, calcular quantas unidades precisa comprar
-    # (antes de MpM) para bater o mínimo
     for d in descontos:
-        if d.min_valor > 0 and preco_base > 0:
-            qtd_necessaria = int(d.min_valor / preco_base) + 1
+        if d.min_valor > 0 and preco_original > 0:
+            qtd_necessaria = int(d.min_valor / preco_original) + 1
             qtds_testar.add(qtd_necessaria)
 
-    melhor_unitario = preco_base
+    melhor_unitario = preco_original
     melhor_qtd = 1
 
     for qtd in sorted(qtds_testar):
-        subtotal = qtd * preco_base
+        subtotal = qtd * preco_original
 
-        # 1. Aplica MpM: pega o maior desconto para a qtd
-        pct_mpm = 0.0
-        for min_qtd, pct in tiers_mpm:
-            if qtd >= min_qtd:
-                pct_mpm = pct  # já está ordenado, então sobrescreve com o maior válido
+        # MpM acumulativo: soma todos os tiers válidos para a quantidade
+        pct_mpm_total = sum(pct for min_qtd, pct in tiers_mpm if qtd >= min_qtd)
 
-        subtotal_pos_mpm = subtotal * (1 - pct_mpm)
+        # Cupons % acumulativos
+        pct_cupom_total = sum(
+            d.pct for d in descontos
+            if d.tipo == 'cupom_pct' and subtotal >= d.min_valor
+        )
 
-        # 2. Aplica cupons % (todos que forem válidos)
-        total_pct_cupom = 0.0
-        for d in descontos:
-            if d.tipo == 'cupom_pct' and subtotal_pos_mpm >= d.min_valor:
-                total_pct_cupom += d.pct
+        # Total % de desconto (sobre subtotal original)
+        pct_total = pct_mpm_total + pct_cupom_total
 
-        subtotal_pos_cupom_pct = subtotal_pos_mpm * (1 - total_pct_cupom)
+        # Cupons fixos
+        fixo_total = sum(
+            d.fixo for d in descontos
+            if d.tipo == 'cupom_fixo' and subtotal >= d.min_valor
+        )
 
-        # 3. Aplica cupons fixos (todos que forem válidos)
-        total_fixo_cupom = 0.0
-        for d in descontos:
-            if d.tipo == 'cupom_fixo' and subtotal_pos_mpm >= d.min_valor:
-                total_fixo_cupom += d.fixo
+        total_final = subtotal * (1 - pct_total) - fixo_total
 
-        total_final = subtotal_pos_cupom_pct - total_fixo_cupom
-
-        # Proteção: total não pode ser negativo
         if total_final <= 0:
             continue
 
         unitario = total_final / qtd
-
         if unitario < melhor_unitario:
             melhor_unitario = unitario
             melhor_qtd = qtd
@@ -482,13 +514,13 @@ def calcular_melhor_preco_unitario(
 
 
 # ---------------------------------------------------------------------------
-# Orquestração: preço + descontos + melhor unitário
+# Orquestração: preço + descontos + melhor unitário (uma requisição por SKU)
 # ---------------------------------------------------------------------------
 
 def processar_fornecedor(url: str) -> tuple[float | None, str, str]:
     """
-    Faz uma única requisição à página do fornecedor e retorna:
-      (preco, texto_coluna_I, texto_coluna_J)
+    Retorna (preco_coluna_e, texto_coluna_i, texto_coluna_j).
+    Faz apenas uma requisição HTTP.
     """
     from bs4 import BeautifulSoup
 
@@ -498,24 +530,28 @@ def processar_fornecedor(url: str) -> tuple[float | None, str, str]:
 
     soup = BeautifulSoup(resp.text, "lxml")
 
-    preco = extrair_preco_fornecedor_soup(soup, url)
-    if preco is None:
+    preco_e, preco_base_j = extrair_preco_fornecedor_soup(soup, url)
+    if preco_e is None:
         return None, "", ""
 
-    descontos, texto_i = extrair_descontos_amazon(soup, url)
+    descontos, texto_i = extrair_descontos(soup, url)
 
-    if descontos:
-        melhor_un, melhor_qtd = calcular_melhor_preco_unitario(preco, descontos)
-        if melhor_qtd > 1:
+    texto_j = ""
+    if preco_base_j:
+        # Se há P&P, inclui o desconto implícito do P&P no cálculo da coluna J.
+        # A Amazon aplica P&P junto com MpM e cupons, todos sobre o preço original.
+        descontos_calc = list(descontos)
+        if preco_e and preco_base_j > preco_e:
+            pct_pp = (preco_base_j - preco_e) / preco_base_j
+            descontos_calc.append(Desconto(tipo='cupom_pct', codigo='P&P', pct=pct_pp))
+            log.info("P&P incluído no cálculo J: %.1f%%", pct_pp * 100)
+
+        if descontos_calc:
+            melhor_un, melhor_qtd = calcular_melhor_preco_unitario(preco_base_j, descontos_calc)
             texto_j = f"R${melhor_un:,.2f} ({melhor_qtd}un)"
-        else:
-            # Sem ganho: mesmo preço, mas mostra por clareza
-            texto_j = f"R${melhor_un:,.2f} (1un)"
-        log.info("Melhor unitário: %s", texto_j)
-    else:
-        texto_j = ""  # não Amazon ou sem descontos → deixa coluna J vazia
+            log.info("Melhor unitário: %s", texto_j)
 
-    return preco, texto_i, texto_j
+    return preco_e, texto_i, texto_j
 
 
 # ---------------------------------------------------------------------------
@@ -577,15 +613,12 @@ def processar() -> None:
             ws.update(f"G{row_idx}:H{row_idx}", [["⚠️ Erro na leitura", agora]])
             continue
 
-        # Atualiza D e E (preços brutos)
         ws.update(f"D{row_idx}:E{row_idx}", [[round(preco_ml, 2), round(preco_forn, 2)]])
         time.sleep(0.5)
 
-        # Atualiza I (descontos) e J (melhor unitário)
         ws.update(f"I{row_idx}:J{row_idx}", [[texto_i, texto_j]])
         time.sleep(0.3)
 
-        # Relê F (fórmula do usuário recalculada pelo Sheets)
         pmc_atualizado = parse_valor(ws.cell(row_idx, COL_PMC + 1).value)
         pmc = pmc_atualizado if pmc_atualizado else pmc_padrao(preco_ml)
         origem = "planilha" if pmc_atualizado else "padrão"
