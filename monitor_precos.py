@@ -242,13 +242,15 @@ def extrair_preco_ml(url: str) -> float | None:
 def fetch_url(url: str):
     try:
         if SCRAPER_API_KEY:
+            # Drogasil/Drogaraia: preço com desconto carrega via JS tardio — espera extra
+            wait = "&wait=5000" if ("drogasil" in url or "drogaraia" in url) else ""
             api_url = (
                 f"http://api.scraperapi.com"
                 f"?api_key={SCRAPER_API_KEY}"
                 f"&url={requests.utils.quote(url, safe='')}"
-                f"&country_code=br&render=true"
+                f"&country_code=br&render=true{wait}"
             )
-            resp = requests.get(api_url, timeout=60)
+            resp = requests.get(api_url, timeout=90)
         else:
             resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
