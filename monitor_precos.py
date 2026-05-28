@@ -53,13 +53,11 @@ ML_CLIENT_ID     = "3934461305870964"
 ML_CLIENT_SECRET = "TwDkUlKf3nAfKWD1FZUBOEKUSGzpbAZy"
 ML_TOKENS_FILE   = "/data/ml_tokens.json"
 
-# Tokens iniciais — serão sobrescritos pelo arquivo após o primeiro refresh
 _ML_INITIAL_ACCESS_TOKEN  = os.environ.get("ML_ACCESS_TOKEN", "APP_USR-3934461305870964-052722-e8c49f1290af808d061b4356d02b055d-643972290")
 _ML_INITIAL_REFRESH_TOKEN = os.environ.get("ML_REFRESH_TOKEN", "TG-6a17a3d4bff5d60001aa0b45-643972290")
 
 
 def _carregar_tokens() -> dict:
-    """Lê tokens do arquivo em disco; usa os iniciais se não existir."""
     if os.path.exists(ML_TOKENS_FILE):
         try:
             with open(ML_TOKENS_FILE) as f:
@@ -79,7 +77,6 @@ def _salvar_tokens(tokens: dict) -> None:
 
 
 def renovar_token_ml() -> str:
-    """Usa o refresh_token para obter um novo access_token. Retorna o novo token."""
     tokens = _carregar_tokens()
     log.info("Renovando access_token ML...")
     r = requests.post(
@@ -105,7 +102,6 @@ def renovar_token_ml() -> str:
 
 
 def obter_token_ml() -> str:
-    """Retorna o access_token atual, renovando se necessário."""
     tokens = _carregar_tokens()
     r = requests.get(
         "https://api.mercadolibre.com/users/me",
@@ -169,42 +165,24 @@ def extrair_preco_ml(url: str) -> float | None:
         headers_ml = {"Authorization": f"Bearer {token}"}
 
         if tipo == 'catalog':
-            # 1. Busca o produto para encontrar o vencedor do catálogo (buy box)
+            # O ML retorna os items ordenados: o primeiro é o vencedor do catálogo
             resp = requests.get(
-                f"https://api.mercadolibre.com/products/{item_id}",
+                f"https://api.mercadolibre.com/products/{item_id}/items",
                 headers=headers_ml, timeout=15
             )
             if resp.status_code == 200:
-                data = resp.json()
-                winner_item_id = data.get("buy_box_winner", {}).get("item_id")
-
-                if winner_item_id:
-                    # 2. Busca o preço do item vencedor diretamente
-                    resp_item = requests.get(
-                        f"https://api.mercadolibre.com/items/{winner_item_id}",
-                        headers=headers_ml, timeout=15
-                    )
-                    if resp_item.status_code == 200:
-                        preco = resp_item.json().get("price")
-                        if preco:
-                            log.info("API ML catálogo winner (%s → %s): R$ %.2f",
-                                     item_id, winner_item_id, float(preco))
-                            return float(preco)
-                else:
-                    log.warning("buy_box_winner não encontrado para %s, usando fallback.", item_id)
-
-            # Fallback: lista de items ativos, pega o primeiro (geralmente o winner)
-            resp = requests.get(
-                f"https://api.mercadolibre.com/products/{item_id}/items?status=active",
-                headers=headers_ml, timeout=15
-            )
-            if resp.status_code == 200:
-                resultados = resp.json().get("results", [])
-                if resultados:
-                    preco = float(resultados[0]["price"])
-                    log.info("API ML catálogo fallback (1º item ativo): %s → R$ %.2f",
-                             item_id, preco)
-                    return preco
+                results = resp.json().get("results", [])
+                if results:
+                    winner = results[0]
+                    winner_item_id = winner.get("item_id")
+                    preco = winner.get("price")
+                    if preco:
+                        log.info("API ML catálogo winner (%s → %s): R$ %.2f",
+                                 item_id, winner_item_id, float(preco))
+                        return float(preco)
+            log.warning("Nenhum item encontrado no catálogo %s (status %s)",
+                        item_id, resp.status_code)
+            return None
 
         # Item direto (não catálogo)
         resp = requests.get(
@@ -212,8 +190,7 @@ def extrair_preco_ml(url: str) -> float | None:
             headers=headers_ml, timeout=15
         )
         if resp.status_code == 200:
-            data = resp.json()
-            preco = data.get("price")
+            preco = resp.json().get("price")
             if preco:
                 log.info("API ML item: %s → R$ %.2f", item_id, float(preco))
                 return float(preco)
