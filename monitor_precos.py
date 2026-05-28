@@ -340,7 +340,12 @@ def processar() -> None:
         # Relê coluna F após atualizar D e E (Sheets recalcula a fórmula)
         try:
             pmc_cell = ws.cell(row_idx, 6).value
-            pmc_str = re.sub(r"[^\d.,]", "", str(pmc_cell or "")).replace(".", "").replace(",", ".")
+            pmc_str = re.sub(r"[^\d.,]", "", str(pmc_cell or ""))
+            # Formato brasileiro: 1.234,56 → float
+            if "," in pmc_str and "." in pmc_str:
+                pmc_str = pmc_str.replace(".", "").replace(",", ".")
+            elif "," in pmc_str:
+                pmc_str = pmc_str.replace(",", ".")
             pmc = float(pmc_str) if pmc_str else calcular_pmc(preco_ml)
         except Exception:
             pmc = calcular_pmc(preco_ml)
