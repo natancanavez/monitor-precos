@@ -53,7 +53,7 @@ ML_CLIENT_ID     = "3934461305870964"
 ML_CLIENT_SECRET = "TwDkUlKf3nAfKWD1FZUBOEKUSGzpbAZy"
 ML_TOKENS_FILE   = "/data/ml_tokens.json"
 
-_ML_INITIAL_ACCESS_TOKEN  = os.environ.get("ML_ACCESS_TOKEN", "APP_USR-3934461305870964-052722-e8c49f1290af808d061b4356d02b055d-643972290")
+_ML_INITIAL_ACCESS_TOKEN  = os.environ.get("ML_ACCESS_TOKEN", "")
 _ML_INITIAL_REFRESH_TOKEN = os.environ.get("ML_REFRESH_TOKEN", "TG-6a17a3d4bff5d60001aa0b45-643972290")
 
 
@@ -260,11 +260,33 @@ def extrair_preco_fornecedor(url: str) -> float | None:
                 pass
 
         if "amazon" in url:
-            el = soup.select_one("span.a-price-whole")
-            if el:
-                v = re.sub(r"[^\d]", "", el.get_text())
-                if v:
-                    return float(v)
+            sns_seletores = ["#sns-tiered-price", "#sns-base-price", "#subscriptionPrice", "#snsAccordionRowMiddle"]
+            for sel in sns_seletores:
+                el = soup.select_one(sel)
+                if el:
+                    nums = re.findall(r"[\d]+[.,][\d]{2}", el.get_text(strip=True))
+                    if nums:
+                        try:
+                            v = nums[0].replace(".", "").replace(",", ".")
+                            preco = float(v)
+                            if preco > 0:
+                                log.info("Amazon Programe e Poupe (%s): R$ %.2f", sel, preco)
+                                return preco
+                        except Exception:
+                            pass
+            for sel in ["#apex-pricetopay-accessibility-label", ".a-price .a-offscreen", "span.a-price-whole"]:
+                el = soup.select_one(sel)
+                if el:
+                    nums = re.findall(r"[\d]+[.,][\d]{2}", el.get_text(strip=True))
+                    if nums:
+                        try:
+                            v = nums[0].replace(".", "").replace(",", ".")
+                            preco = float(v)
+                            if preco > 0:
+                                log.info("Amazon preço normal (%s): R$ %.2f", sel, preco)
+                                return preco
+                        except Exception:
+                            pass
 
         for sel in ["[class*='price'] [class*='value']", "[class*='preco']", "[class*='price']"]:
             el = soup.select_one(sel)
@@ -337,11 +359,14 @@ def processar() -> None:
             ws.update(f"G{row_idx}:H{row_idx}", [["⚠️ Erro na leitura", agora]])
             continue
 
+        # Atualiza D e E com números puros — deixa F intacta (fórmula do usuário)
+        ws.update(f"D{row_idx}:E{row_idx}", [[round(preco_ml, 2), round(preco_forn, 2)]])
+        time.sleep(0.3)
+
         # Relê coluna F após atualizar D e E (Sheets recalcula a fórmula)
         try:
             pmc_cell = ws.cell(row_idx, 6).value
             pmc_str = re.sub(r"[^\d.,]", "", str(pmc_cell or ""))
-            # Formato brasileiro: 1.234,56 → float
             if "," in pmc_str and "." in pmc_str:
                 pmc_str = pmc_str.replace(".", "").replace(",", ".")
             elif "," in pmc_str:
@@ -373,10 +398,6 @@ def processar() -> None:
                     f"Data: {agora}"
                 )
 
-        # Atualiza D e E (preços) — deixa F intacta (fórmula do usuário)
-        ws.update(f"D{row_idx}:E{row_idx}", [[round(preco_ml, 2), round(preco_forn, 2)]])
-        time.sleep(0.3)
-        # Atualiza G e H (status e data)
         ws.update(f"G{row_idx}:H{row_idx}", [[status, agora]])
 
         log.info("  ML=R$%.2f  Forn=R$%.2f  PMC=R$%.2f  → %s",
