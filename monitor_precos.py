@@ -441,15 +441,17 @@ def extrair_descontos(soup, url: str) -> tuple[list[Desconto], str]:
 
 
 def _debug_trecho_descontos(texto_pagina: str) -> None:
-    """Loga os 300 chars ao redor das palavras-chave para diagnóstico."""
-    for palavra in ["Mais por Menos", "cupom", "Resgatar", "BOLANAREDE"]:
+    """Loga trechos ao redor de cada palavra-chave de desconto."""
+    encontrou = False
+    for palavra in ["cupom", "Economize", "BOLANAREDE", "Resgatar"]:
         idx = texto_pagina.lower().find(palavra.lower())
         if idx >= 0:
-            trecho = texto_pagina[max(0, idx-50):idx+250]
+            trecho = texto_pagina[max(0, idx-30):idx+200]
             trecho = " ".join(trecho.split())
-            log.info("DEBUG desconto [%s]: ...%s...", palavra, trecho)
-            return
-    log.info("DEBUG: nenhuma palavra-chave de desconto encontrada na página.")
+            log.info("DEBUG [%s]: ...%s...", palavra, trecho)
+            encontrou = True
+    if not encontrou:
+        log.info("DEBUG: nenhuma palavra-chave de desconto encontrada na página.")
 
 
 def _coletar_blocos_cupom_amazon(soup) -> list[str]:
