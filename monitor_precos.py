@@ -1,10 +1,11 @@
 """
 monitor_precos.py
 1. Lê produtos do Google Sheets
-2. Raspa preços do ML via API oficial (vencedor do catálogo)
-3. Raspa preços do fornecedor via ScraperAPI
-4. Atualiza colunas 4-6 no Google Sheets
-5. Envia alertas via Telegram quando necessário
+2. Renova token ML automaticamente via refresh_token
+3. Busca preço do vencedor do catálogo ML via API oficial
+4. Raspa preços do fornecedor via ScraperAPI
+5. Atualiza colunas no Google Sheets
+6. Envia alertas via Telegram quando necessário
 """
 
 import re
@@ -44,13 +45,82 @@ HEADERS = {
 }
 
 DESCONTO        = COMISSAO_ML + IMPOSTO_DAS + MARGEM_MIN
-ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 SHEETS_ID       = os.environ.get("SHEETS_ID", "")
+
+# ── Credenciais ML ────────────────────────────────────────────────────────────
+ML_CLIENT_ID     = "3934461305870964"
+ML_CLIENT_SECRET = "TwDkUlKf3nAfKWD1FZUBOEKUSGzpbAZy"
+ML_TOKENS_FILE   = "/data/ml_tokens.json"
+
+# Tokens iniciais — serão sobrescritos pelo arquivo após o primeiro refresh
+_ML_INITIAL_ACCESS_TOKEN  = os.environ.get("ML_ACCESS_TOKEN", "APP_USR-3934461305870964-052722-e8c49f1290af808d061b4356d02b055d-643972290")
+_ML_INITIAL_REFRESH_TOKEN = os.environ.get("ML_REFRESH_TOKEN", "TG-6a17a3d4bff5d60001aa0b45-643972290")
+
+
+def _carregar_tokens() -> dict:
+    """Lê tokens do arquivo em disco; usa os iniciais se não existir."""
+    if os.path.exists(ML_TOKENS_FILE):
+        try:
+            with open(ML_TOKENS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "access_token": _ML_INITIAL_ACCESS_TOKEN,
+        "refresh_token": _ML_INITIAL_REFRESH_TOKEN,
+    }
+
+
+def _salvar_tokens(tokens: dict) -> None:
+    os.makedirs(os.path.dirname(ML_TOKENS_FILE), exist_ok=True)
+    with open(ML_TOKENS_FILE, "w") as f:
+        json.dump(tokens, f)
+
+
+def renovar_token_ml() -> str:
+    """Usa o refresh_token para obter um novo access_token. Retorna o novo token."""
+    tokens = _carregar_tokens()
+    log.info("Renovando access_token ML...")
+    r = requests.post(
+        "https://api.mercadolibre.com/oauth/token",
+        data={
+            "grant_type":    "refresh_token",
+            "client_id":     ML_CLIENT_ID,
+            "client_secret": ML_CLIENT_SECRET,
+            "refresh_token": tokens["refresh_token"],
+        },
+        timeout=15,
+    )
+    if r.status_code == 200:
+        data = r.json()
+        tokens["access_token"]  = data["access_token"]
+        tokens["refresh_token"] = data.get("refresh_token", tokens["refresh_token"])
+        _salvar_tokens(tokens)
+        log.info("Token ML renovado com sucesso ✅")
+        return tokens["access_token"]
+    else:
+        log.error("Erro ao renovar token ML: %s %s", r.status_code, r.text)
+        return tokens["access_token"]
+
+
+def obter_token_ml() -> str:
+    """Retorna o access_token atual, renovando se necessário."""
+    tokens = _carregar_tokens()
+    r = requests.get(
+        "https://api.mercadolibre.com/users/me",
+        headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        timeout=10,
+    )
+    if r.status_code == 401:
+        return renovar_token_ml()
+    return tokens["access_token"]
+
 
 # ── Fórmula PMC ──────────────────────────────────────────────────────────────
 def calcular_pmc(preco_ml: float) -> float:
     return round(preco_ml * (1 - DESCONTO) - FRETE_FIXO, 2)
+
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 def conectar_sheets():
@@ -95,7 +165,8 @@ def extrair_preco_ml(url: str) -> float | None:
             log.warning("Item ID ML não encontrado: %s", url)
             return None
 
-        headers_ml = {"Authorization": f"Bearer {ML_ACCESS_TOKEN}"} if ML_ACCESS_TOKEN else {}
+        token = obter_token_ml()
+        headers_ml = {"Authorization": f"Bearer {token}"}
 
         if tipo == 'catalog':
             # 1. Busca o produto para encontrar o vencedor do catálogo (buy box)
@@ -276,7 +347,6 @@ def processar() -> None:
         if not sku or not link_ml or not link_forn:
             continue
 
-        # Status anterior
         status_ant = row[6].strip() if len(row) > 6 else ""
 
         log.info("Processando SKU %s ...", sku)
@@ -326,7 +396,7 @@ def processar() -> None:
         log.info("  ML=R$%.2f  Forn=R$%.2f  PMC=R$%.2f  → %s",
                  preco_ml, preco_forn, pmc, status)
 
-        time.sleep(1)  # Evita rate limit do Sheets
+        time.sleep(1)
 
     log.info("Planilha atualizada no Google Sheets ✅")
 
