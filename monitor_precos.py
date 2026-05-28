@@ -514,7 +514,6 @@ def _parsear_cupons_do_bloco(texto: str) -> list[Desconto]:
         texto, re.IGNORECASE
     ):
         trecho = m.group(0)
-        # Busca min_valor ANTES de "cupom:" para não pegar dígitos do código
         pre_cupom = trecho[:trecho.lower().rfind('cupom')]
         vals = re.findall(r'[\d.,]+', pre_cupom)
         min_val = parse_valor(vals[-1]) if len(vals) >= 2 else 0.0
