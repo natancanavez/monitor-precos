@@ -91,15 +91,9 @@ def conectar_sheets():
  
  
 def garantir_cabecalhos(ws) -> None:
+    # Apenas loga os cabeçalhos, não sobrescreve
     headers = ws.row_values(1)
-    esperados = [
-        "SKU", "Link ML", "Link Fornecedor",
-        "Preço ML (R$)", "Preço Fornecedor (R$)", "PMC Calculado (R$)",
-        "Fórmula PMC", "Status", "Última Atualização",
-    ]
-    if headers != esperados:
-        ws.update("A1:I1", [esperados])
-        log.info("Cabeçalhos atualizados na planilha.")
+    log.info("Cabeçalhos encontrados: %s", headers)
  
  
 # ── Scraper ML ────────────────────────────────────────────────────────────────
