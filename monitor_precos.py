@@ -279,6 +279,32 @@ def extrair_preco_fornecedor_soup(soup, url: str) -> tuple[float | None, float |
       - ambos são iguais (sem distinção P&P/original)
     """
     if "amazon" not in url:
+        # Drogasil / Drogaraia — prioriza Leve+Pague, depois preço com desconto
+        if "drogasil" in url or "drogaraia" in url:
+            el = soup.select_one(".floating-price-position-lmpm")
+            if el:
+                nums = re.findall(r"\d+[.,]\d{2}", el.get_text(strip=True))
+                if nums:
+                    try:
+                        p = float(nums[0].replace(".", "").replace(",", "."))
+                        if p > 0:
+                            log.info("Drogasil Leve+Pague: R$ %.2f", p)
+                            return p, p
+                    except Exception:
+                        pass
+            for sel in [".product-price", ".price-pdp-content", "#pdp-price-container"]:
+                el = soup.select_one(sel)
+                if el:
+                    nums = re.findall(r"\d+[.,]\d{2}", el.get_text(strip=True))
+                    if nums:
+                        try:
+                            p = float(nums[0].replace(".", "").replace(",", "."))
+                            if p > 0:
+                                log.info("Drogasil preço (%s): R$ %.2f", sel, p)
+                                return p, p
+                        except Exception:
+                            pass
+
         p = _extrair_preco_generico(soup)
         if p:
             log.info("Preço fornecedor: R$ %.2f", p)
