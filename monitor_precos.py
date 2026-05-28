@@ -176,11 +176,10 @@ def extrair_preco_fornecedor(url: str) -> float | None:
             except Exception:
                 pass
         if "amazon" in url:
-            # Tenta Programe e Poupe (apex-pricetopay = preço final com desconto P&P)
-            el = soup.select_one("#apex-pricetopay-accessibility-label")
+            # Tenta Programe e Poupe via #subscriptionPrice
+            el = soup.select_one("#subscriptionPrice")
             if el:
                 texto = el.get_text(strip=True)
-                # Ex: "R$ 129,03 com 10 por cento de desconto"
                 nums = re.findall(r"[\d]+[.,][\d]+", texto)
                 if nums:
                     try:
@@ -194,6 +193,7 @@ def extrair_preco_fornecedor(url: str) -> float | None:
 
             # Fallback: preço normal
             for sel in [
+                "#apex-pricetopay-accessibility-label",
                 "#priceblock_ourprice",
                 "#priceblock_dealprice",
                 ".a-price .a-offscreen",
